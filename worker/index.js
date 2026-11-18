@@ -219,6 +219,33 @@ const MEDIA_DOMAINS = new Set([
   'rumble.com', 'odysee.com', 'kick.com', 'streamable.com'
 ]);
 
+const ENGINE_ORDER = ['auto', 'aria2c', 'ytdlp'];
+
+function normalizeEngine(v) {
+  const x = String(v || 'auto').toLowerCase().replace(/[-_\s]/g, '');
+  if (x === 'aria' || x === 'aria2') return 'aria2c';
+  return ENGINE_ORDER.includes(x) ? x : 'auto';
+}
+
+function nextEngine(v) {
+  const i = ENGINE_ORDER.indexOf(normalizeEngine(v));
+  return ENGINE_ORDER[(i + 1) % ENGINE_ORDER.length];
+}
+
+function engineLabel(v) {
+  const e = normalizeEngine(v);
+  if (e === 'aria2c') return 'Aria2c (16x)';
+  if (e === 'ytdlp') return 'yt-dlp';
+  return 'Auto';
+}
+
+function engineDesc(v) {
+  const e = normalizeEngine(v);
+  if (e === 'aria2c') return 'Aria2c 16x (manual)';
+  if (e === 'ytdlp') return 'yt-dlp native 16x fragments (manual)';
+  return 'Auto (best engine per link)';
+}
+
 function ytQualityLabel(q) {
   return YT_QUALITY_LABELS[q] || 'Best Video';
 }
@@ -505,6 +532,7 @@ function getEffectiveProfile(userId, stored) {
     ghRepo: base.ghRepo || '',
     defaultDest,
     leechAsDoc: !!base.leechAsDoc,
+    engine: normalizeEngine(base.engine),
     buttonMode: base.buttonMode !== false,
     autoShare: !!base.autoShare,
     conflict: base.conflict || 'rename',
@@ -1193,6 +1221,9 @@ function buildTaskMenuMessage(task) {
   if (isLeech) {
     extras += `\n✓ <b>Upload As:</b> ${task.leechAsDoc ? 'Document (Original File)' : 'Media (Stream Video / Audio)'}`;
   }
+  if (!task.isTgMedia && !task.isDrive) {
+    extras += `\n✓ <b>Engine:</b> ${escapeHtml(engineDesc(task.engine))}`;
+  }
   if (isGhRelease) {
     extras += `\n✓ <b>GitHub Account:</b> <code>@${escapeHtml(task.ghUser || 'connected')}</code>`;
     extras += `\n✓ <b>Repository:</b> ${task.ghRepo ? `<code>${escapeHtml(task.ghRepo)}</code>` : '<i>Tap Select Repo below</i>'}`;
@@ -1322,6 +1353,14 @@ function buildTaskMenuKeyboard(task) {
       style: 'primary'
     };
     rows.push([typeBtn]);
+  }
+
+  if (!task.isTgMedia && !task.isDrive) {
+    rows.push([{
+      text: `⚙️ Engine: ${engineLabel(task.engine)}`,
+      callback_data: `tm_engine:${tid}`,
+      style: 'primary'
+    }]);
   }
 
   if (task.isYtdl) {
@@ -3152,6 +3191,7 @@ async function startTaskFromTelegramMedia(msg, tgMedia, env, ctx = {}) {
     acceptRanges: true,
     dest: defaultDest,
     leechAsDoc: !!profile.leechAsDoc,
+    engine: normalizeEngine(profile.engine),
     hasDrive: mCtx.hasDrive,
     hasGithub: !!mCtx.hasGithub,
     ghUser: mCtx.ghUser || '',
@@ -3394,6 +3434,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         acceptRanges: true,
         dest: defaultDest,
         leechAsDoc: !!profile.leechAsDoc,
+        engine: normalizeEngine(profile.engine),
         hasDrive,
         hasGithub: !!mCtx.hasGithub,
         ghUser: mCtx.ghUser || '',
@@ -3490,6 +3531,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         acceptRanges: verification.acceptRanges || false,
         dest: defaultDest,
         leechAsDoc: !!profile.leechAsDoc,
+        engine: normalizeEngine(profile.engine),
         hasDrive,
         hasGithub: !!mCtx.hasGithub,
         ghUser: mCtx.ghUser || '',
@@ -3578,6 +3620,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       acceptRanges: false,
       dest: defaultDest,
       leechAsDoc: !!profile.leechAsDoc,
+      engine: normalizeEngine(profile.engine),
       hasDrive,
       hasGithub: !!mCtx.hasGithub,
       ghUser: mCtx.ghUser || '',
@@ -5053,6 +5096,14 @@ async function handleCallbackQuery(cb, env) {
       return;
     }
 
+    if (action === 'tm_engine') {
+      task.engine = nextEngine(task.engine);
+      await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
+      await editMessage(chatId, msgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
+      await answerCb(cb.id, `Engine: ${engineDesc(task.engine)}`, false, env);
+      return;
+    }
+
     if (action === 'tm_dest') {
       const profile = await getUserProfile(userId, env);
       const canUseSharedGc = !!(task.chatType && task.chatType !== 'private' && task.driveFolderId && !hasDriveAuth(profile));
@@ -5328,6 +5379,13 @@ async function handleCallbackQuery(cb, env) {
       profile.leechAsDoc = !profile.leechAsDoc;
       await saveUserProfile(userId, profile, env);
       await answerCb(cb.id, `Leech As: ${profile.leechAsDoc ? 'Document' : 'Media (Auto)'}`, false, env);
+      await sendSettingsMenu(chatId, userId, profile, msgId, env, threadId);
+      return;
+    }
+    if (data === 'cfg_engine') {
+      profile.engine = nextEngine(profile.engine);
+      await saveUserProfile(userId, profile, env);
+      await answerCb(cb.id, `Default Engine: ${engineDesc(profile.engine)}`, false, env);
       await sendSettingsMenu(chatId, userId, profile, msgId, env, threadId);
       return;
     }
@@ -5631,6 +5689,7 @@ async function launchMirrorTask(task, env) {
     fileSize: task.fileSize,
     dest,
     leechAsDoc: !!task.leechAsDoc,
+    engine: normalizeEngine(task.engine),
     ghRepo: isGhRelease ? (task.ghRepo || '') : '',
     ghUser: isGhRelease ? (ghProfile?.ghUser || task.ghUser || '') : '',
     ghTag: isGhRelease ? ghTagFinal : '',
@@ -6390,6 +6449,7 @@ async function sendSettingsMenu(chatId, userId, profile, editMsgId, env, threadI
     `Default Dest  ·  ${escapeHtml(destStr)}\n\n` +
     `${ghLine}` +
     `Leech Upload As  ·  ${leechModeStr}\n\n` +
+    `Download Engine  ·  ${escapeHtml(engineDesc(eff.engine))}\n\n` +
     (hasDrive ? `Target Folder  ·  ${escapeHtml(eff.folderName || 'My Drive')}\n\n` : '') +
     `ButtonMode  ·  ${eff.buttonMode !== false ? 'Enabled' : 'Disabled'}\n\n` +
     (hasDrive
@@ -6408,6 +6468,7 @@ async function sendSettingsMenu(chatId, userId, profile, editMsgId, env, threadI
     { text: `Dest: ${destBtnLabel}`, callback_data: 'cfg_toggle_dest', style: 'primary' },
     { text: `Leech: ${eff.leechAsDoc ? 'Document' : 'Media'}`, callback_data: 'cfg_toggle_asdoc' }
   ]);
+  rows.push([{ text: `⚙️ Engine: ${engineLabel(eff.engine)}`, callback_data: 'cfg_engine', style: 'primary' }]);
   if (hasDrive && hasGithub) {
     rows.push([
       { text: '📁 Drive Folder', callback_data: 'cfg_dir', style: 'primary' },

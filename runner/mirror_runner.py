@@ -68,6 +68,17 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 TAR_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tgz", ".tbz2", ".txz", ".tar")
 COMPOUND_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst")
 ARIA_ENGINE = "Aria2c v1.37.0"
+
+
+ENGINE_CHOICES = ("auto", "aria2c", "ytdlp")
+
+
+def normalize_engine(value) -> str:
+    """Download engine chosen by the user: auto (smart pick), aria2c, or ytdlp."""
+    v = str(value or "auto").strip().lower().replace("-", "").replace("_", "")
+    if v in ("aria", "aria2"):
+        v = "aria2c"
+    return v if v in ENGINE_CHOICES else "auto"
 GC_TEMP_NOTICE_HTML = (
     "⚠ <b>Temporary Group Storage (5 Days):</b> File(s) will be deleted after <b>5 days</b>. "
     "Use /login with your personal Google Drive for permanent storage, or contact the Owner."
@@ -1641,6 +1652,7 @@ class Mirror:
         self.message_id = job.get("messageId")
         self.dest = job.get("dest") or "gdrive"
         self.leech_as_doc = bool(job.get("leechAsDoc"))
+        self.engine = normalize_engine(job.get("engine"))
         self.gh_pat = (job.get("ghPat") or "").strip()
         self.gh_repo = (job.get("ghRepo") or "").strip()
         self.gh_user = (job.get("ghUser") or "").strip()
@@ -2657,8 +2669,17 @@ class Mirror:
             return opts
 
         is_yt = _is_youtube_url(url)
-        use_dashy_primary = is_yt and not trim_spec
-        use_aria_primary = bool(shutil.which("aria2c")) and not is_yt and not trim_spec
+        if self.engine == "aria2c":
+            # Manual: yt-dlp extracts, aria2c (16x) downloads the streams
+            use_dashy_primary = False
+            use_aria_primary = bool(shutil.which("aria2c")) and not trim_spec
+        elif self.engine == "ytdlp":
+            # Manual: yt-dlp native downloader with 16 parallel fragments, no aria2c
+            use_dashy_primary = is_yt and not trim_spec
+            use_aria_primary = False
+        else:
+            use_dashy_primary = is_yt and not trim_spec
+            use_aria_primary = bool(shutil.which("aria2c")) and not is_yt and not trim_spec
         cookie_path = prepare_ytdl_cookiefile()
 
         def run_ydl(use_aria: bool, use_dashy: bool):
@@ -3302,6 +3323,15 @@ class Mirror:
             if mime.startswith("application/vnd.google-apps."):
                 raise RuntimeError("Google Docs/Sheets/Slides files cannot be downloaded for archiving.")
             return self.gdrive_download_file(item, meta, dest_dir, name)
+        if self.engine == "ytdlp" and re.match(r"^https?://", item.get("url") or "", re.I):
+            # Manual yt-dlp engine on a direct link: try yt-dlp first, fall back to aria2c if it can't handle it
+            try:
+                return self.ytdl_download(item["url"], dest_dir)
+            except InterruptedError:
+                raise
+            except Exception as e:
+                print(f"[engine] yt-dlp could not handle direct link ({e}); falling back to aria2c")
+                self.tick(self.job.get("detectedName") or "Download", "Retrying (Aria2c)..", 0.0, 0, 0, 0, None, ARIA_ENGINE, force=True)
         return self.aria_download(item["url"], dest_dir, out_name=self.single_name(), label=self.item_label(item))
 
     def _make_fast_kurigram_client_cls(self, base_client_cls):
