@@ -2604,7 +2604,7 @@ async function handleTelegramUpdate(update, env) {
   const parsedCmd = parseCommand(text);
   const cmd = parsedCmd ? parsedCmd.cmd : '';
   const cmdArgs = parsedCmd ? parsedCmd.args : '';
-  const directMedia = extractTelegramMedia(msg);
+  const directMedia = extractTelegramMedia(msg, ['/m', '/mirror', '/l', '/leech'].includes(cmd));
 
   // 1) DM Access Control: Owner & Admins only
   if (isPrivate) {
@@ -2996,7 +2996,7 @@ async function handleTelegramUpdate(update, env) {
   let urls = extractUrls(text);
 
   if (!urls.length && (isMCmd || isYtCmd || isLCmd) && msg.reply_to_message) {
-    const repliedMedia = extractTelegramMedia(msg.reply_to_message);
+    const repliedMedia = extractTelegramMedia(msg.reply_to_message, true);
     if (repliedMedia && (isMCmd || isLCmd)) {
       await startTaskFromTelegramMedia(msg, repliedMedia, env, {
         chatType,
@@ -3115,9 +3115,9 @@ async function handleGroupLinkRequest(dmChatId, userId, username, rawInput, env)
   );
 }
 
-function extractTelegramMedia(msg) {
+function extractTelegramMedia(msg, allowPhoto = false) {
   if (!msg) return null;
-  const media =
+  let media =
     msg.document ||
     msg.video ||
     msg.audio ||
@@ -3125,11 +3125,29 @@ function extractTelegramMedia(msg) {
     msg.voice ||
     msg.video_note ||
     null;
+  // Photos / stickers are only picked up when explicitly asked for (reply or caption with /m, /l)
+  let isPhoto = false;
+  let isSticker = false;
+  if (!media && allowPhoto) {
+    if (Array.isArray(msg.photo) && msg.photo.length) {
+      media = msg.photo.reduce((best, p) => ((p.file_size || 0) >= (best.file_size || 0) ? p : best), msg.photo[0]);
+      isPhoto = true;
+    } else if (msg.sticker) {
+      media = msg.sticker;
+      isSticker = true;
+    }
+  }
   if (!media || !media.file_id) return null;
 
   let kind = 'document';
   let defaultExt = '.bin';
-  if (msg.video) {
+  if (isPhoto) {
+    kind = 'photo';
+    defaultExt = '.jpg';
+  } else if (isSticker) {
+    kind = 'sticker';
+    defaultExt = media.is_video ? '.webm' : (media.is_animated ? '.tgs' : '.webp');
+  } else if (msg.video) {
     kind = 'video';
     defaultExt = '.mp4';
   } else if (msg.audio) {
@@ -3148,6 +3166,11 @@ function extractTelegramMedia(msg) {
 
   const mime =
     media.mime_type ||
+    (kind === 'photo'
+      ? 'image/jpeg'
+      : kind === 'sticker'
+        ? (media.is_video ? 'video/webm' : (media.is_animated ? 'application/x-tgsticker' : 'image/webp'))
+        : null) ||
     (kind === 'video' || kind === 'animation' || kind === 'video_note'
       ? 'video/mp4'
       : kind === 'audio'
