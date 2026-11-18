@@ -477,9 +477,20 @@ function hasDriveAuth(profile) {
   return !!(profile && profile.refreshToken);
 }
 
+function hasGithubAuth(profile) {
+  return !!(profile && profile.ghPat && profile.ghUser);
+}
+
 function getEffectiveProfile(userId, stored) {
   const base = stored || {};
   const hasDrive = hasDriveAuth(base);
+  const hasGithub = hasGithubAuth(base);
+  const allowedDests = new Set(['gofile', 'telegram']);
+  if (hasDrive) allowedDests.add('gdrive');
+  if (hasGithub) allowedDests.add('ghrelease');
+  const defaultDest = allowedDests.has(base.defaultDest)
+    ? base.defaultDest
+    : (hasDrive ? 'gdrive' : 'gofile');
   return {
     userId,
     email: base.email || '',
@@ -488,9 +499,11 @@ function getEffectiveProfile(userId, stored) {
     tokenExpiry: base.tokenExpiry || 0,
     folderId: base.folderId || 'root',
     folderName: base.folderName || 'My Drive',
-    defaultDest: hasDrive
-      ? (['gofile', 'telegram'].includes(base.defaultDest) ? base.defaultDest : 'gdrive')
-      : (base.defaultDest === 'telegram' ? 'telegram' : 'gofile'),
+    ghPat: base.ghPat || '',
+    ghUser: base.ghUser || '',
+    ghScopes: base.ghScopes || '',
+    ghRepo: base.ghRepo || '',
+    defaultDest,
     leechAsDoc: !!base.leechAsDoc,
     buttonMode: base.buttonMode !== false,
     autoShare: !!base.autoShare,
@@ -734,6 +747,376 @@ async function renderFolderBrowserPage(chatId, userId, browserState, page, editM
 }
 
 // ============================================================================
+// GITHUB AUTH, REPO BROWSER & RELEASE WIZARD (/ghlogin)
+// ============================================================================
+
+function ghHeaders(pat) {
+  return {
+    Authorization: `Bearer ${pat}`,
+    Accept: 'application/vnd.github+json',
+    'User-Agent': 'waguri-mirror-bot'
+  };
+}
+
+async function fetchUserWritableRepos(pat, maxPages = 2) {
+  const repos = [];
+  for (let page = 1; page <= maxPages; page++) {
+    const res = await fetch(
+      `https://api.github.com/user/repos?affiliation=owner,collaborator,organization_member&sort=updated&per_page=100&page=${page}`,
+      { headers: ghHeaders(pat) }
+    );
+    if (!res.ok) {
+      if (page === 1) throw new Error(`GitHub repos API returned HTTP ${res.status}`);
+      break;
+    }
+    const batch = await res.json();
+    if (!Array.isArray(batch) || !batch.length) break;
+    for (const r of batch) {
+      if (r.archived) continue;
+      if (r.permissions && (r.permissions.push || r.permissions.maintain || r.permissions.admin)) {
+        repos.push({
+          fullName: r.full_name,
+          isPrivate: !!r.private,
+          defaultBranch: r.default_branch || 'main'
+        });
+      }
+    }
+    if (batch.length < 100) break;
+  }
+  return repos;
+}
+
+async function verifyGithubPat(rawPat) {
+  const pat = String(rawPat || '').trim();
+  if (!pat || /\s/.test(pat)) {
+    return { ok: false, error: 'Invalid token format. Paste a single GitHub Personal Access Token with no spaces.' };
+  }
+  const userRes = await fetch('https://api.github.com/user', { headers: ghHeaders(pat) });
+  if (!userRes.ok) {
+    return { ok: false, error: `GitHub rejected this PAT (HTTP ${userRes.status}). Check that the token is active and not expired.` };
+  }
+  const userData = await userRes.json();
+  if (!userData?.login) {
+    return { ok: false, error: 'Could not read GitHub account login from token.' };
+  }
+
+  const scopesHdr = userRes.headers.get('X-OAuth-Scopes');
+  let scopeList = [];
+  let tokenKind = 'fine-grained';
+  if (scopesHdr !== null && scopesHdr.trim() !== '') {
+    tokenKind = 'classic';
+    scopeList = scopesHdr.split(',').map(s => s.trim()).filter(Boolean);
+    const hasRepoScope = scopeList.includes('repo') || scopeList.includes('public_repo');
+    if (!hasRepoScope) {
+      return {
+        ok: false,
+        error:
+          `Missing required Classic PAT permissions.\n` +
+          `Detected scopes: <code>${escapeHtml(scopeList.join(', ') || 'none')}</code>\n` +
+          `Required: <code>repo</code> (public + private repos) or <code>public_repo</code> (public repos only).`
+      };
+    }
+  }
+
+  let repos = [];
+  try {
+    repos = await fetchUserWritableRepos(pat, 2);
+  } catch (err) {
+    return { ok: false, error: err?.message || 'Failed to list writable repositories.' };
+  }
+
+  if (!repos.length) {
+    return {
+      ok: false,
+      error:
+        `No writable repositories found for <b>@${escapeHtml(userData.login)}</b>.\n` +
+        `Make sure your PAT has access to at least one repository with <b>Contents: Read &amp; Write</b> (or Classic <code>repo</code> scope).`
+    };
+  }
+
+  if (tokenKind === 'fine-grained') {
+    const probe = await fetch(
+      `https://api.github.com/repos/${repos[0].fullName}/releases?per_page=1`,
+      { headers: ghHeaders(pat) }
+    );
+    if (probe.status === 403) {
+      return {
+        ok: false,
+        error:
+          `Token cannot access Releases on <code>${escapeHtml(repos[0].fullName)}</code> (HTTP 403).\n` +
+          `Grant <b>Repository permissions → Contents: Read and write</b> and try again.`
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    user: userData.login,
+    scopes: tokenKind === 'classic' ? scopeList.join(', ') : 'fine-grained (Contents R/W)',
+    repos
+  };
+}
+
+async function openGhRepoBrowser(chatId, userId, editMsgId = null, returnTaskId = null, env, page = 0, threadId = null) {
+  const profile = await getUserProfile(userId, env);
+  if (!hasGithubAuth(profile)) {
+    await sendGhLoginScreen(chatId, userId, env, { editMsgId, threadId });
+    return;
+  }
+
+  let repos = [];
+  try {
+    repos = await fetchUserWritableRepos(profile.ghPat, 2);
+  } catch (_) {
+    repos = [];
+  }
+
+  if (!repos.length) {
+    const msg =
+      `<blockquote><b>No Writable Repositories Found</b></blockquote>\n\n` +
+      `Could not list writable repos for <code>@${escapeHtml(profile.ghUser)}</code>.\n` +
+      `Reconnect via /ghlogin if your token expired or lacks permissions.`;
+    if (editMsgId) {
+      await editMessage(chatId, editMsgId, msg, env, returnTaskId ? {
+        inline_keyboard: [[{ text: '↩ Back to Task', callback_data: `tm_back:${returnTaskId}`, style: 'primary' }]]
+      } : null);
+    } else {
+      await sendMessage(chatId, msg, env, null, null, threadId);
+    }
+    return;
+  }
+
+  const browserState = {
+    page,
+    returnTaskId: returnTaskId || null,
+    threadId: threadId || null,
+    selectedRepo: profile.ghRepo || '',
+    repos
+  };
+  await renderGhRepoBrowserPage(chatId, userId, browserState, page, editMsgId, env);
+}
+
+async function renderGhRepoBrowserPage(chatId, userId, browserState, page, editMsgId, env) {
+  const repos = browserState.repos || [];
+  const pageSize = 8;
+  const totalPages = Math.max(1, Math.ceil(repos.length / pageSize));
+  const safePage = Math.max(0, Math.min(page, totalPages - 1));
+  browserState.page = safePage;
+  await getStore(env).put(`ghbrowser:${userId}`, JSON.stringify(browserState), { expirationTtl: 3600 });
+
+  const pageItems = repos.slice(safePage * pageSize, (safePage + 1) * pageSize);
+  const rows = [];
+  for (let i = 0; i < pageItems.length; i++) {
+    const idx = safePage * pageSize + i;
+    const repo = pageItems[i];
+    const isSel = browserState.selectedRepo && browserState.selectedRepo === repo.fullName;
+    const visIcon = repo.isPrivate ? '🔒' : '🌐';
+    const mark = isSel ? '✓ ' : '';
+    rows.push([{
+      text: `${mark}${visIcon} ${truncate(repo.fullName, 36)}`,
+      callback_data: `ghr_sel:${idx}`,
+      style: isSel ? 'success' : undefined
+    }]);
+  }
+
+  if (totalPages > 1) {
+    const navRow = [];
+    if (safePage > 0) navRow.push({ text: '‹ Prev', callback_data: `ghr_page:${safePage - 1}`, style: 'primary' });
+    navRow.push({ text: `${safePage + 1} / ${totalPages}`, callback_data: 'ghr_noop' });
+    if (safePage < totalPages - 1) navRow.push({ text: 'Next ›', callback_data: `ghr_page:${safePage + 1}`, style: 'primary' });
+    rows.push(navRow);
+  }
+
+  rows.push([{ text: '⌨️ Type owner/repo Manually', callback_data: 'ghr_manual', style: 'primary' }]);
+  if (browserState.returnTaskId) {
+    rows.push([{ text: '↩ Back to Task', callback_data: `ghr_back:${browserState.returnTaskId}`, style: 'primary' }]);
+  } else {
+    rows.push([{ text: 'Close', callback_data: 'ghr_close', style: 'danger' }]);
+  }
+
+  const headerText =
+    `<blockquote><b>Select GitHub Repository</b>\n\n` +
+    `${browserState.selectedRepo ? `Current  ·  <code>${escapeHtml(browserState.selectedRepo)}</code>` : 'No repository selected yet'}</blockquote>\n\n` +
+    `Writable Repos  ·  <code>${repos.length}</code>\n\n` +
+    `<i>Tap a repository below to upload GitHub Releases to it.</i>`;
+
+  const markup = { inline_keyboard: rows };
+  if (editMsgId) {
+    await editMessage(chatId, editMsgId, headerText, env, markup);
+  } else {
+    await sendMessage(chatId, headerText, env, markup, null, browserState.threadId || null);
+  }
+}
+
+async function sendGhLoginScreen(chatId, userId, env, opts = {}) {
+  const { editMsgId = null, replyToMsgId = null, threadId = null, isGroup = false } = opts;
+  const stored = await getUserProfile(userId, env);
+  const connected = hasGithubAuth(stored);
+
+  const permText =
+    `<blockquote><b>GitHub Release Authentication</b></blockquote>\n\n` +
+    (connected
+      ? `Connected Account  ·  <b>@${escapeHtml(stored.ghUser)}</b>\n` +
+        `Permissions  ·  <code>${escapeHtml(stored.ghScopes || 'verified')}</code>\n` +
+        `Default Repo  ·  <code>${escapeHtml(stored.ghRepo || 'Not selected')}</code>\n\n` +
+        `<i>Paste a new GitHub PAT below to replace your token, or manage your repo below:</i>`
+      : `Connect your GitHub account with a Personal Access Token (PAT) so releases publish under your own account.\n\n` +
+        `<b>Required Token Permissions:</b>\n` +
+        `• <b>Classic PAT:</b> check <code>repo</code> (public &amp; private) or <code>public_repo</code> (public only)\n` +
+        `• <b>Fine-grained PAT:</b> select repo(s) → <b>Contents: Read &amp; Write</b> + <b>Metadata: Read</b>\n\n` +
+        `<b>Send/paste your GitHub PAT now</b> (or /cancel):` +
+        (isGroup ? `\n<i>Your PAT message will be deleted immediately after verification. DM is recommended for privacy.</i>` : ''));
+
+  const kbRows = [
+    [
+      { text: '🔑 Create Classic PAT', url: 'https://github.com/settings/tokens/new?scopes=repo&description=Mirror+Bot+Releases', style: 'primary' },
+      { text: '🛡 Fine-grained PAT', url: 'https://github.com/settings/personal-access-tokens/new', style: 'primary' }
+    ]
+  ];
+  if (connected) {
+    kbRows.push([
+      { text: '📦 Select Default Repo', callback_data: 'gh_login_repo', style: 'success' },
+      { text: '🔌 Disconnect GitHub', callback_data: 'gh_login_disconnect', style: 'danger' }
+    ]);
+  }
+  const kb = { inline_keyboard: kbRows };
+
+  let targetMsgId = editMsgId;
+  if (editMsgId) {
+    await editMessage(chatId, editMsgId, permText, env, kb);
+  } else {
+    const sent = await sendMessage(chatId, permText, env, kb, replyToMsgId, threadId);
+    targetMsgId = sent?.result?.message_id || null;
+  }
+
+  await getStore(env).put(
+    promptKey(chatId, userId),
+    JSON.stringify({ type: 'gh_pat', menuMsgId: targetMsgId, threadId }),
+    { expirationTtl: 600 }
+  );
+}
+
+function defaultGhAutoTag() {
+  const now = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  return `v${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}-${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}`;
+}
+
+async function openGhReleaseWizard(task, step, env, editMsgIdOverride = null) {
+  const tid = task.taskId;
+  const chatId = task.chatId;
+  const userId = task.userId;
+  const msgId = editMsgIdOverride || task.menuMsgId;
+  const pKey = promptKey(chatId, userId);
+  const autoTag = task.ghTag || defaultGhAutoTag();
+  const defTitle = task.ghTitle || task.customName || task.detectedName || autoTag;
+
+  if (step === 'tag') {
+    await getStore(env).put(
+      pKey,
+      JSON.stringify({ type: 'gh_rel_tag', taskId: tid, threadId: task.threadId || null }),
+      { expirationTtl: 1800 }
+    );
+    const text =
+      `<blockquote><b>GitHub Release Setup · Step 1/3</b>\n\n` +
+      `Repo  ·  <code>${escapeHtml(task.ghRepo)}</code>\n` +
+      `File  ·  <code>${escapeHtml(truncate(task.customName || task.detectedName || 'Upload', 48))}</code></blockquote>\n\n` +
+      `Send the <b>Release Tag</b> now (e.g. <code>v1.0.0</code>, <code>nightly</code>), or tap below to use an auto tag:\n\n` +
+      `<i>Auto tag:</i> <code>${escapeHtml(autoTag)}</code>`;
+    const kb = {
+      inline_keyboard: [
+        [{ text: `⚡ Use Auto Tag (${autoTag})`, callback_data: `ghrel_auto:${tid}:tag`, style: 'success' }],
+        [{ text: '↩ Back to Task Options', callback_data: `tm_back:${tid}`, style: 'primary' }]
+      ]
+    };
+    await editMessage(chatId, msgId, text, env, kb);
+    return;
+  }
+
+  if (step === 'title') {
+    await getStore(env).put(
+      pKey,
+      JSON.stringify({ type: 'gh_rel_title', taskId: tid, threadId: task.threadId || null }),
+      { expirationTtl: 1800 }
+    );
+    const text =
+      `<blockquote><b>GitHub Release Setup · Step 2/3</b>\n\n` +
+      `Repo  ·  <code>${escapeHtml(task.ghRepo)}</code>\n` +
+      `Tag  ·  <code>${escapeHtml(task.ghTag || autoTag)}</code></blockquote>\n\n` +
+      `Send the <b>Release Title</b> now, or tap below to use the default title:\n\n` +
+      `<i>Default:</i> <code>${escapeHtml(truncate(defTitle, 64))}</code>`;
+    const kb = {
+      inline_keyboard: [
+        [{ text: '⚡ Use Default Title', callback_data: `ghrel_auto:${tid}:title`, style: 'success' }],
+        [{ text: '↩ Back to Tag', callback_data: `ghrel_step:${tid}:tag`, style: 'primary' }]
+      ]
+    };
+    await editMessage(chatId, msgId, text, env, kb);
+    return;
+  }
+
+  if (step === 'notes') {
+    await getStore(env).put(
+      pKey,
+      JSON.stringify({ type: 'gh_rel_notes', taskId: tid, threadId: task.threadId || null }),
+      { expirationTtl: 1800 }
+    );
+    const text =
+      `<blockquote><b>GitHub Release Setup · Step 3/3</b>\n\n` +
+      `Repo  ·  <code>${escapeHtml(task.ghRepo)}</code>\n` +
+      `Tag  ·  <code>${escapeHtml(task.ghTag || autoTag)}</code>\n` +
+      `Title  ·  <code>${escapeHtml(truncate(task.ghTitle || defTitle, 56))}</code></blockquote>\n\n` +
+      `Send the <b>Release Description / Notes</b> (Markdown supported), or choose an option below:`;
+    const kb = {
+      inline_keyboard: [
+        [
+          { text: '⏭ Skip Description', callback_data: `ghrel_auto:${tid}:skipnotes`, style: 'primary' },
+          { text: '✨ Auto-Generate Notes', callback_data: `ghrel_auto:${tid}:gennotes`, style: 'primary' }
+        ],
+        [{ text: '↩ Back to Title', callback_data: `ghrel_step:${tid}:title`, style: 'primary' }]
+      ]
+    };
+    await editMessage(chatId, msgId, text, env, kb);
+    return;
+  }
+
+  // Confirm step
+  await getStore(env).delete(pKey);
+  const tagVal = task.ghTag || autoTag;
+  const titleVal = task.ghTitle || defTitle;
+  const notesPreview = task.ghGenerateNotes
+    ? 'Auto-generated by GitHub'
+    : (task.ghNotes ? truncate(task.ghNotes.replace(/\s+/g, ' '), 90) : 'None');
+
+  const confirmText =
+    `<blockquote><b>Ready to Publish GitHub Release</b>\n\n` +
+    `Repo  ·  <code>${escapeHtml(task.ghRepo)}</code>\n` +
+    `Account  ·  <code>@${escapeHtml(task.ghUser || 'github')}</code></blockquote>\n\n` +
+    `🏷 <b>Tag:</b> <code>${escapeHtml(tagVal)}</code>\n` +
+    `📝 <b>Title:</b> <code>${escapeHtml(truncate(titleVal, 72))}</code>\n` +
+    `📄 <b>Notes:</b> <code>${escapeHtml(notesPreview)}</code>\n` +
+    `🧪 <b>Pre-release:</b> ${task.ghPrerelease ? 'Yes' : 'No'}    📋 <b>Draft:</b> ${task.ghDraft ? 'Yes' : 'No'}\n\n` +
+    `<i>Click the button below to start downloading and uploading the release asset(s) via GitHub CLI.</i>`;
+
+  const kb = {
+    inline_keyboard: [
+      [{ text: '🚀 Publish GitHub Release', callback_data: `ghrel_launch:${tid}`, style: 'success' }],
+      [
+        { text: `🧪 Pre-release: ${task.ghPrerelease ? 'ON' : 'OFF'}`, callback_data: `ghrel_pre:${tid}` },
+        { text: `📋 Draft: ${task.ghDraft ? 'ON' : 'OFF'}`, callback_data: `ghrel_draft:${tid}` }
+      ],
+      [
+        { text: '✏️ Tag', callback_data: `ghrel_step:${tid}:tag` },
+        { text: '✏️ Title', callback_data: `ghrel_step:${tid}:title` },
+        { text: '✏️ Notes', callback_data: `ghrel_step:${tid}:notes` }
+      ],
+      [{ text: '↩ Back to Task Options', callback_data: `tm_back:${tid}`, style: 'primary' }]
+    ]
+  };
+  await editMessage(chatId, msgId, confirmText, env, kb);
+}
+
+// ============================================================================
 // TASK OPTIONS MENU
 // ============================================================================
 
@@ -746,6 +1129,7 @@ function conflictLabel(policy) {
 function buildTaskMenuMessage(task) {
   const isGofile = task.dest === 'gofile';
   const isLeech = task.dest === 'telegram';
+  const isGhRelease = task.dest === 'ghrelease';
   let extras = '';
   if (task.batch) {
     extras += `\n✓ <b>Batch:</b> <code>${task.items.length} links</code>`;
@@ -765,7 +1149,7 @@ function buildTaskMenuMessage(task) {
     }
     extras += `\n✓ <b>Source:</b> Telegram MTProto (Kurigram)`;
   } else if (task.isDrive) {
-    extras += `\n✓ <b>Source:</b> ${task.isFolder ? 'Google Drive Folder' : ((isGofile || isLeech) ? 'Google Drive' : 'Google Drive (Server-Side)')}`;
+    extras += `\n✓ <b>Source:</b> ${task.isFolder ? 'Google Drive Folder' : ((isGofile || isLeech || isGhRelease) ? 'Google Drive' : 'Google Drive (Server-Side)')}`;
   } else if (task.isGofileSource) {
     extras += `\n✓ <b>Source:</b> Gofile ${task.isFolder ? 'Folder' : 'File'}`;
     if (task.detectedName) {
@@ -809,7 +1193,11 @@ function buildTaskMenuMessage(task) {
   if (isLeech) {
     extras += `\n✓ <b>Upload As:</b> ${task.leechAsDoc ? 'Document (Original File)' : 'Media (Stream Video / Audio)'}`;
   }
-  if (!isGofile && !isLeech) {
+  if (isGhRelease) {
+    extras += `\n✓ <b>GitHub Account:</b> <code>@${escapeHtml(task.ghUser || 'connected')}</code>`;
+    extras += `\n✓ <b>Repository:</b> ${task.ghRepo ? `<code>${escapeHtml(task.ghRepo)}</code>` : '<i>Tap Select Repo below</i>'}`;
+  }
+  if (!isGofile && !isLeech && !isGhRelease) {
     if (task.share) {
       extras += `\n✓ <b>Share:</b> Anyone with link`;
     }
@@ -822,13 +1210,15 @@ function buildTaskMenuMessage(task) {
     }
   }
 
-  const destLine = isLeech
-    ? `✓ <b>Destination:</b> Telegram (Leech to Chat)`
-    : isGofile
-      ? `✓ <b>Destination:</b> Gofile (New Guest Account)`
-      : task.isSharedGcTemp
-        ? `✓ <b>Destination:</b> Shared Group Drive (5-Day Temp)`
-        : `✓ <b>Custom Upload:</b> ${escapeHtml(task.folderName || 'My Drive')}`;
+  const destLine = isGhRelease
+    ? `✓ <b>Destination:</b> GitHub Release`
+    : isLeech
+      ? `✓ <b>Destination:</b> Telegram (Leech to Chat)`
+      : isGofile
+        ? `✓ <b>Destination:</b> Gofile (New Guest Account)`
+        : task.isSharedGcTemp
+          ? `✓ <b>Destination:</b> Shared Group Drive (5-Day Temp)`
+          : `✓ <b>Custom Upload:</b> ${escapeHtml(task.folderName || 'My Drive')}`;
   const leechWarnLines = [
     (!task.batch && task.fileSize >= TG_BOT_MAX_BYTES)
       ? `📤 <b>Telegram Leech (&gt; 2 GB):</b> Automatically splits into <code>1.95 GB</code> 7z parts before uploading to Telegram.`
@@ -836,13 +1226,17 @@ function buildTaskMenuMessage(task) {
     `⚠️ <b>Copyright Warning:</b> Do not leech copyrighted content — it could get the group and bot both flagged or banned.${task.chatType === 'private' ? ' Files auto-delete in <b>30 min</b> in DM.' : ''}`
   ];
   const leechNoticeHtml = leechWarnLines.join('\n\n');
-  const warnBlock = isLeech
-    ? `\n\n<blockquote>${leechNoticeHtml}</blockquote>`
-    : isGofile
-      ? `\n\n<blockquote>${GOFILE_NOTICE_HTML}</blockquote>`
-      : task.isSharedGcTemp
-        ? `\n\n<blockquote>${GC_TEMP_NOTICE_HTML}</blockquote>`
-        : '';
+  const ghNoticeHtml =
+    `🐙 <b>GitHub Release:</b> Clicking Start will ask for your release Tag, Title &amp; Description before uploading via <code>gh</code> CLI (assets ≥ <code>2.00 GiB</code> auto-split into <code>1.95 GiB</code> volumes).`;
+  const warnBlock = isGhRelease
+    ? `\n\n<blockquote>${ghNoticeHtml}</blockquote>`
+    : isLeech
+      ? `\n\n<blockquote>${leechNoticeHtml}</blockquote>`
+      : isGofile
+        ? `\n\n<blockquote>${GOFILE_NOTICE_HTML}</blockquote>`
+        : task.isSharedGcTemp
+          ? `\n\n<blockquote>${GC_TEMP_NOTICE_HTML}</blockquote>`
+          : '';
 
   return (
     `📌 <b>Choose option for your task?</b>\n\n` +
@@ -855,6 +1249,7 @@ function buildTaskMenuKeyboard(task) {
   const tid = task.taskId;
   const isGofile = task.dest === 'gofile';
   const isLeech = task.dest === 'telegram';
+  const isGhRelease = task.dest === 'ghrelease';
   const extLabel = task.mode === 'extract' ? '✓ Extract' : 'Extract';
   const zipLabel = task.mode === 'zip' ? '✓ Create ZIP' : 'Create ZIP';
   const renLabel = task.batch && task.mode === 'zip'
@@ -865,20 +1260,37 @@ function buildTaskMenuKeyboard(task) {
   const shareLabel = task.share ? '✓ Share Link' : 'Share Link';
   const confText = `Duplicate: ${conflictLabel(task.conflict || 'rename')}`;
   const folderShort = truncate(task.driveFolderName || task.folderName || 'My Drive', 14);
-  const destBtnText = isLeech
-    ? '📤 Dest: Telegram (Leech)'
-    : isGofile
-      ? '☁️ Dest: Gofile (Temp)'
-      : task.isSharedGcTemp
-        ? '☁️ Dest: GC Drive (5d)'
-        : '☁️ Dest: Google Drive';
+  const repoShort = truncate(task.ghRepo || 'Select Repo', 18);
+  const destBtnText = isGhRelease
+    ? '🐙 Dest: GitHub Release'
+    : isLeech
+      ? '📤 Dest: Telegram (Leech)'
+      : isGofile
+        ? '☁️ Dest: Gofile (Temp)'
+        : task.isSharedGcTemp
+          ? '☁️ Dest: GC Drive (5d)'
+          : '☁️ Dest: Google Drive';
+
+  const startBtnText = isGhRelease
+    ? '▶️ START GH RELEASE'
+    : (isLeech ? '▶️ START LEECH' : '▶️ START MIRROR');
 
   const rows = [
-    [{ text: isLeech ? '▶️ START LEECH' : '▶️ START MIRROR', callback_data: `tm_start:${tid}`, style: 'success' }]
+    [{ text: startBtnText, callback_data: `tm_start:${tid}`, style: 'success' }]
   ];
 
   const canRename = !task.batch || task.mode === 'zip';
-  if (isLeech || isGofile || task.isSharedGcTemp) {
+  if (isGhRelease) {
+    rows.push([{ text: destBtnText, callback_data: `tm_dest:${tid}`, style: 'primary' }]);
+    if (canRename) {
+      rows.push([
+        { text: renLabel, callback_data: `tm_ren:${tid}` },
+        { text: `📦 Repo: ${repoShort}`, callback_data: `tm_ghrepo:${tid}`, style: task.ghRepo ? 'success' : 'primary' }
+      ]);
+    } else {
+      rows.push([{ text: `📦 Repo: ${repoShort}`, callback_data: `tm_ghrepo:${tid}`, style: task.ghRepo ? 'success' : 'primary' }]);
+    }
+  } else if (isLeech || isGofile || task.isSharedGcTemp) {
     if (canRename) {
       rows.push([
         { text: renLabel, callback_data: `tm_ren:${tid}` },
@@ -983,7 +1395,7 @@ function buildTaskMenuKeyboard(task) {
     }
   }
 
-  if (!isGofile && !isLeech) {
+  if (!isGofile && !isLeech && !isGhRelease) {
     if (task.isSharedGcTemp) {
       rows.push([{ text: confText, callback_data: `tm_confmenu:${tid}` }]);
     } else {
@@ -1581,6 +1993,9 @@ async function resolveMirrorContext(chatType, chatId, actorUserId, chatRecord, e
   const isPrivate = chatType === 'private';
   const isChannel = chatType === 'channel';
   const storedUser = (!isChannel && actorUserId) ? await getUserProfile(actorUserId, env) : null;
+  const userHasGh = hasGithubAuth(storedUser);
+  const userGhUser = storedUser?.ghUser || '';
+  const userGhRepo = storedUser?.ghRepo || '';
 
   if (isPrivate || hasDriveAuth(storedUser)) {
     const uid = actorUserId || getOwnerId(env);
@@ -1588,26 +2003,34 @@ async function resolveMirrorContext(chatType, chatId, actorUserId, chatRecord, e
     const hasDrive = hasDriveAuth(storedUser);
     const dest = profile.defaultDest === 'telegram'
       ? 'telegram'
-      : (hasDrive ? (profile.defaultDest === 'gofile' ? 'gofile' : 'gdrive') : 'gofile');
+      : (profile.defaultDest === 'ghrelease' && userHasGh)
+        ? 'ghrelease'
+        : (hasDrive ? (profile.defaultDest === 'gofile' ? 'gofile' : 'gdrive') : 'gofile');
     return {
       credUserId: String(uid),
       profile,
       hasDrive,
+      hasGithub: userHasGh,
+      ghUser: userGhUser,
+      ghRepo: userGhRepo,
       dest,
       isSharedGcTemp: false,
-      folderId: (dest === 'gofile' || dest === 'telegram') ? '' : (profile.folderId || 'root'),
-      folderName: dest === 'telegram' ? 'Telegram (Leech)' : (dest === 'gofile' ? 'Gofile (Guest)' : (profile.folderName || 'My Drive')),
+      folderId: (dest === 'gdrive') ? (profile.folderId || 'root') : '',
+      folderName: dest === 'ghrelease'
+        ? (userGhRepo || 'GitHub Release')
+        : (dest === 'telegram' ? 'Telegram (Leech)' : (dest === 'gofile' ? 'Gofile (Guest)' : (profile.folderName || 'My Drive'))),
       driveFolderId: profile.folderId || 'root',
       driveFolderName: profile.folderName || 'My Drive',
-      share: dest === 'telegram' ? false : !!profile.autoShare
+      share: (dest === 'telegram' || dest === 'ghrelease') ? false : !!profile.autoShare
     };
   }
 
-  // Group/Channel user without personal /login (unless user chose Telegram Leech default)
+  // Group/Channel user without personal /login (unless user chose Telegram Leech or GitHub Release default)
   const credOwnerId = String(chatRecord?.credOwnerId || getOwnerId(env));
   const ownerToken = await getValidAccessToken(credOwnerId, env);
   const userEff = getEffectiveProfile(actorUserId || credOwnerId, storedUser);
-  if (!isChannel && storedUser?.defaultDest === 'telegram') {
+  if (!isChannel && (storedUser?.defaultDest === 'telegram' || (storedUser?.defaultDest === 'ghrelease' && userHasGh))) {
+    const chosenDest = storedUser.defaultDest;
     let driveFolderId = '';
     let driveFolderName = '';
     if (ownerToken) {
@@ -1619,12 +2042,15 @@ async function resolveMirrorContext(chatType, chatId, actorUserId, chatRecord, e
     }
     return {
       credUserId: credOwnerId,
-      profile: { ...userEff, defaultDest: 'telegram' },
+      profile: { ...userEff, defaultDest: chosenDest },
       hasDrive: false,
-      dest: 'telegram',
+      hasGithub: userHasGh,
+      ghUser: userGhUser,
+      ghRepo: userGhRepo,
+      dest: chosenDest,
       isSharedGcTemp: false,
       folderId: '',
-      folderName: 'Telegram (Leech)',
+      folderName: chosenDest === 'ghrelease' ? (userGhRepo || 'GitHub Release') : 'Telegram (Leech)',
       driveFolderId,
       driveFolderName,
       share: false
@@ -1638,6 +2064,9 @@ async function resolveMirrorContext(chatType, chatId, actorUserId, chatRecord, e
         credUserId: credOwnerId,
         profile: { ...userEff, defaultDest: 'gdrive' },
         hasDrive: false,
+        hasGithub: userHasGh,
+        ghUser: userGhUser,
+        ghRepo: userGhRepo,
         dest: 'gdrive',
         isSharedGcTemp: true,
         folderId: tempFolder.folderId,
@@ -1655,6 +2084,9 @@ async function resolveMirrorContext(chatType, chatId, actorUserId, chatRecord, e
     credUserId: String(actorUserId || credOwnerId),
     profile: fallbackProfile,
     hasDrive: false,
+    hasGithub: userHasGh,
+    ghUser: userGhUser,
+    ghRepo: userGhRepo,
     dest: 'gofile',
     isSharedGcTemp: false,
     folderId: '',
@@ -2145,7 +2577,7 @@ async function handleTelegramUpdate(update, env) {
 
     chatRecord = await getApprovedChat(chatId, env);
     if (!chatRecord) {
-      const explicitTrigger = isChannel || ['/start', '/help', '/m', '/mirror', '/yt', '/ytdl', '/login', '/request', '/reqgroup'].includes(cmd);
+      const explicitTrigger = isChannel || ['/start', '/help', '/m', '/mirror', '/l', '/leech', '/yt', '/ytdl', '/login', '/ghlogin', '/request', '/reqgroup'].includes(cmd);
       if (explicitTrigger) {
         const res = await requestChatApproval(msg.chat, hasActor ? msg.from : null, env);
         if (isGroup) {
@@ -2165,7 +2597,7 @@ async function handleTelegramUpdate(update, env) {
     }
   }
 
-  // 3) Active prompt input (Rename / Filter / Password / mkdir / Admin Add)
+  // 3) Active prompt input (Rename / Filter / Password / mkdir / Admin Add / GH PAT / Release Setup)
   const pKey = promptKey(chatId, userId);
   const promptRaw = await getStore(env).get(pKey);
   if (promptRaw && !directMedia && (text || msg.forward_from)) {
@@ -2174,10 +2606,14 @@ async function handleTelegramUpdate(update, env) {
       await sendMessage(chatId, `<i>Input cancelled.</i>`, env, null, msg.message_id, threadId);
       return;
     }
-    const promptState = JSON.parse(promptRaw);
-    await getStore(env).delete(pKey);
-    await handleUserPromptInput(chatId, userId, text, promptState, msg.message_id, env, threadId, msg);
-    return;
+    if (cmd && ['/start', '/help', '/login', '/logout', '/ghlogin', '/ghlogout', '/settings'].includes(cmd)) {
+      await getStore(env).delete(pKey);
+    } else {
+      const promptState = JSON.parse(promptRaw);
+      await getStore(env).delete(pKey);
+      await handleUserPromptInput(chatId, userId, text, promptState, msg.message_id, env, threadId, msg);
+      return;
+    }
   }
 
   // 4) Direct media handling
@@ -2338,10 +2774,54 @@ async function handleTelegramUpdate(update, env) {
 
   if (cmd === '/logout') {
     if (isChannel) return;
-    await getStore(env).delete(`user:${userId}`);
+    const stored = await getUserProfile(userId, env);
+    if (hasGithubAuth(stored)) {
+      stored.refreshToken = '';
+      stored.accessToken = '';
+      stored.tokenExpiry = 0;
+      stored.email = '';
+      stored.folderId = 'root';
+      stored.folderName = 'My Drive';
+      if (stored.defaultDest === 'gdrive') stored.defaultDest = 'gofile';
+      await saveUserProfile(userId, stored, env);
+    } else {
+      await getStore(env).delete(`user:${userId}`);
+    }
     await sendMessage(
       chatId,
-      `<blockquote><b>Disconnected</b>\n\nYour Google Drive credentials have been removed.${isGroup ? ' Group mirrors will now use the shared 5-day storage unless you /login again.' : ' You can still mirror to Gofile (temporary guest storage) anytime.'}</blockquote>`,
+      `<blockquote><b>Disconnected</b>\n\nYour Google Drive credentials have been removed.${isGroup ? ' Group mirrors will now use the shared 5-day storage unless you /login again.' : ' You can still mirror to Gofile or GitHub Release anytime.'}</blockquote>`,
+      env,
+      null,
+      msg.message_id,
+      threadId
+    );
+    return;
+  }
+
+  if (cmd === '/ghlogin') {
+    if (isChannel) return;
+    await sendGhLoginScreen(chatId, userId, env, { replyToMsgId: msg.message_id, threadId, isGroup });
+    return;
+  }
+
+  if (cmd === '/ghlogout') {
+    if (isChannel) return;
+    const stored = await getUserProfile(userId, env);
+    if (stored) {
+      if (hasDriveAuth(stored)) {
+        stored.ghPat = '';
+        stored.ghUser = '';
+        stored.ghScopes = '';
+        stored.ghRepo = '';
+        if (stored.defaultDest === 'ghrelease') stored.defaultDest = 'gdrive';
+        await saveUserProfile(userId, stored, env);
+      } else {
+        await getStore(env).delete(`user:${userId}`);
+      }
+    }
+    await sendMessage(
+      chatId,
+      `<blockquote><b>GitHub Disconnected</b>\n\nYour GitHub Personal Access Token has been removed. Use /ghlogin anytime to reconnect.</blockquote>`,
       env,
       null,
       msg.message_id,
@@ -2673,20 +3153,31 @@ async function startTaskFromTelegramMedia(msg, tgMedia, env, ctx = {}) {
     dest: defaultDest,
     leechAsDoc: !!profile.leechAsDoc,
     hasDrive: mCtx.hasDrive,
+    hasGithub: !!mCtx.hasGithub,
+    ghUser: mCtx.ghUser || '',
+    ghRepo: mCtx.ghRepo || '',
+    ghTag: '',
+    ghTitle: '',
+    ghNotes: '',
+    ghPrerelease: false,
+    ghDraft: false,
+    ghGenerateNotes: false,
     driveFolderId: mCtx.driveFolderId,
     driveFolderName: mCtx.driveFolderName,
-    folderId: defaultDest === 'telegram' ? '' : mCtx.folderId,
-    folderName: defaultDest === 'telegram' ? 'Telegram (Leech)' : mCtx.folderName,
+    folderId: (defaultDest === 'telegram' || defaultDest === 'ghrelease') ? '' : mCtx.folderId,
+    folderName: defaultDest === 'ghrelease'
+      ? (mCtx.ghRepo || 'GitHub Release')
+      : (defaultDest === 'telegram' ? 'Telegram (Leech)' : mCtx.folderName),
     mode: 'normal',
     selectFilter: '',
     archivePassword: '',
-    share: defaultDest === 'telegram' ? false : mCtx.share,
+    share: (defaultDest === 'telegram' || defaultDest === 'ghrelease') ? false : mCtx.share,
     conflict: profile.conflict || 'rename',
     duplicateExists,
     createdAt: Date.now()
   };
 
-  if (profile.buttonMode === false) {
+  if (profile.buttonMode === false && defaultDest !== 'ghrelease') {
     const prep = await sendMessage(
       chatId,
       `<blockquote><b>Preparing Telegram Transfer</b>\n\n<code>${escapeHtml(tgMedia.name)}</code></blockquote>`,
@@ -2765,10 +3256,12 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
   const profile = mCtx.profile;
   const hasDrive = mCtx.hasDrive;
   const defaultDest = forceLeech ? 'telegram' : mCtx.dest;
-  const isSharedGcTemp = defaultDest === 'telegram' ? false : mCtx.isSharedGcTemp;
-  const taskFolderId = defaultDest === 'telegram' ? '' : mCtx.folderId;
-  const taskFolderName = defaultDest === 'telegram' ? 'Telegram (Leech)' : mCtx.folderName;
-  const taskShare = defaultDest === 'telegram' ? false : mCtx.share;
+  const isSharedGcTemp = (defaultDest === 'telegram' || defaultDest === 'ghrelease') ? false : mCtx.isSharedGcTemp;
+  const taskFolderId = (defaultDest === 'telegram' || defaultDest === 'ghrelease') ? '' : mCtx.folderId;
+  const taskFolderName = defaultDest === 'ghrelease'
+    ? (mCtx.ghRepo || 'GitHub Release')
+    : (defaultDest === 'telegram' ? 'Telegram (Leech)' : mCtx.folderName);
+  const taskShare = (defaultDest === 'telegram' || defaultDest === 'ghrelease') ? false : mCtx.share;
 
   const hasSourceForge = urls.some(u => isSourceForgeUrl(u));
   const hasGofile = urls.some(u => isGofileUrl(u));
@@ -2902,6 +3395,15 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         dest: defaultDest,
         leechAsDoc: !!profile.leechAsDoc,
         hasDrive,
+        hasGithub: !!mCtx.hasGithub,
+        ghUser: mCtx.ghUser || '',
+        ghRepo: mCtx.ghRepo || '',
+        ghTag: '',
+        ghTitle: '',
+        ghNotes: '',
+        ghPrerelease: false,
+        ghDraft: false,
+        ghGenerateNotes: false,
         driveFolderId: mCtx.driveFolderId,
         driveFolderName: mCtx.driveFolderName,
         folderId: taskFolderId,
@@ -2989,6 +3491,15 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         dest: defaultDest,
         leechAsDoc: !!profile.leechAsDoc,
         hasDrive,
+        hasGithub: !!mCtx.hasGithub,
+        ghUser: mCtx.ghUser || '',
+        ghRepo: mCtx.ghRepo || '',
+        ghTag: '',
+        ghTitle: '',
+        ghNotes: '',
+        ghPrerelease: false,
+        ghDraft: false,
+        ghGenerateNotes: false,
         driveFolderId: mCtx.driveFolderId,
         driveFolderName: mCtx.driveFolderName,
         folderId: taskFolderId,
@@ -3068,6 +3579,15 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       dest: defaultDest,
       leechAsDoc: !!profile.leechAsDoc,
       hasDrive,
+      hasGithub: !!mCtx.hasGithub,
+      ghUser: mCtx.ghUser || '',
+      ghRepo: mCtx.ghRepo || '',
+      ghTag: '',
+      ghTitle: '',
+      ghNotes: '',
+      ghPrerelease: false,
+      ghDraft: false,
+      ghGenerateNotes: false,
       driveFolderId: mCtx.driveFolderId,
       driveFolderName: mCtx.driveFolderName,
       folderId: taskFolderId,
@@ -3084,7 +3604,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
 
   await getStore(env).put(`task:${taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
 
-  if (profile.buttonMode === false) {
+  if (profile.buttonMode === false && defaultDest !== 'ghrelease') {
     await launchMirrorTask(task, env);
     return;
   }
@@ -3302,6 +3822,138 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
     }
     const created = await createRes.json();
     await openFolderBrowser(chatId, userId, created.id, promptState.browserMsgId || null, promptState.returnTaskId || null, env, 0, threadId);
+    return;
+  }
+
+  if (promptState.type === 'gh_pat') {
+    await deleteMessage(chatId, msgId, env);
+    const ver = await verifyGithubPat(text);
+    if (!ver.ok) {
+      await getStore(env).put(promptKey(chatId, userId), JSON.stringify(promptState), { expirationTtl: 600 });
+      await sendMessage(
+        chatId,
+        `<blockquote><b>GitHub Verification Failed</b></blockquote>\n\n${ver.error}\n\n<i>Send a valid PAT to retry, or /cancel.</i>`,
+        env,
+        null,
+        null,
+        threadId
+      );
+      return;
+    }
+
+    const stored = await getUserProfile(userId, env);
+    const profile = getEffectiveProfile(userId, stored);
+    profile.ghPat = text.trim();
+    profile.ghUser = ver.user;
+    profile.ghScopes = ver.scopes;
+    if (profile.ghRepo && !ver.repos.some(r => r.fullName === profile.ghRepo)) {
+      profile.ghRepo = '';
+    }
+    if (!profile.ghRepo && ver.repos.length === 1) {
+      profile.ghRepo = ver.repos[0].fullName;
+    }
+    await saveUserProfile(userId, profile, env);
+
+    const doneText =
+      `<blockquote><b>GitHub Connected ✓</b>\n\n` +
+      `Account  ·  <b>@${escapeHtml(profile.ghUser)}</b></blockquote>\n\n` +
+      `Permissions  ·  <code>${escapeHtml(profile.ghScopes)}</code>\n` +
+      `Writable Repos  ·  <code>${ver.repos.length}</code>\n` +
+      `Default Repo  ·  <code>${escapeHtml(profile.ghRepo || 'Not selected yet')}</code>\n\n` +
+      `<i>You can now pick <b>GitHub Release</b> as destination when mirroring files!</i>`;
+    const kb = {
+      inline_keyboard: [[
+        { text: '📦 Select Default Repo', callback_data: 'gh_login_repo', style: 'success' },
+        { text: '🔌 Disconnect', callback_data: 'gh_login_disconnect', style: 'danger' }
+      ]]
+    };
+    if (promptState.menuMsgId) {
+      await editMessage(chatId, promptState.menuMsgId, doneText, env, kb).catch(async () => {
+        await sendMessage(chatId, doneText, env, kb, null, threadId);
+      });
+    } else {
+      await sendMessage(chatId, doneText, env, kb, null, threadId);
+    }
+    return;
+  }
+
+  if (promptState.type === 'gh_repo_manual') {
+    const repoInput = text.trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/i, '').replace(/^\/+|\/+$/g, '');
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repoInput)) {
+      await sendMessage(chatId, `Invalid format. Send <code>owner/repo</code> (e.g. <code>octocat/hello-world</code>).`, env, null, msgId, threadId);
+      return;
+    }
+    const profile = await getUserProfile(userId, env);
+    if (!hasGithubAuth(profile)) {
+      await sendMessage(chatId, `Please run /ghlogin first.`, env, null, msgId, threadId);
+      return;
+    }
+    const rRes = await fetch(`https://api.github.com/repos/${repoInput}`, { headers: ghHeaders(profile.ghPat) });
+    if (!rRes.ok) {
+      await sendMessage(chatId, `Could not access <code>${escapeHtml(repoInput)}</code> (HTTP ${rRes.status}). Check repo spelling &amp; token permissions.`, env, null, msgId, threadId);
+      return;
+    }
+    const rJson = await rRes.json();
+    if (!rJson.permissions || (!rJson.permissions.push && !rJson.permissions.maintain && !rJson.permissions.admin)) {
+      await sendMessage(chatId, `No push/release permission on <code>${escapeHtml(repoInput)}</code>.`, env, null, msgId, threadId);
+      return;
+    }
+    profile.ghRepo = rJson.full_name || repoInput;
+    await saveUserProfile(userId, profile, env);
+
+    if (promptState.returnTaskId) {
+      const tRaw = await getStore(env).get(`task:${promptState.returnTaskId}`);
+      if (tRaw) {
+        const task = JSON.parse(tRaw);
+        task.dest = 'ghrelease';
+        task.hasGithub = true;
+        task.ghUser = profile.ghUser;
+        task.ghRepo = profile.ghRepo;
+        task.folderName = profile.ghRepo;
+        await getStore(env).put(`task:${task.taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
+        if (promptState.browserMsgId) {
+          await editMessage(chatId, promptState.browserMsgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
+        }
+        await sendMessage(chatId, `Selected Repo  ·  <code>${escapeHtml(profile.ghRepo)}</code>`, env, null, msgId, threadId);
+        return;
+      }
+    }
+    await sendMessage(chatId, `Default GitHub Repo updated  ·  <code>${escapeHtml(profile.ghRepo)}</code>`, env, null, msgId, threadId);
+    return;
+  }
+
+  if (promptState.type === 'gh_rel_tag' || promptState.type === 'gh_rel_title' || promptState.type === 'gh_rel_notes') {
+    const raw = await getStore(env).get(`task:${promptState.taskId}`);
+    if (!raw) {
+      await sendMessage(chatId, `<i>Task session expired.</i>`, env, null, msgId, threadId);
+      return;
+    }
+    const task = JSON.parse(raw);
+    const val = text.trim();
+    let nextStep = 'confirm';
+
+    if (promptState.type === 'gh_rel_tag') {
+      const cleanTag = val.replace(/\s+/g, '-').slice(0, 128);
+      if (!cleanTag) {
+        await openGhReleaseWizard(task, 'tag', env);
+        return;
+      }
+      task.ghTag = cleanTag;
+      nextStep = 'title';
+    } else if (promptState.type === 'gh_rel_title') {
+      task.ghTitle = val.slice(0, 200);
+      nextStep = 'notes';
+    } else if (promptState.type === 'gh_rel_notes') {
+      const clear = val.toLowerCase() === 'skip' || val.toLowerCase() === 'none';
+      task.ghNotes = clear ? '' : val.slice(0, 10000);
+      task.ghGenerateNotes = false;
+      nextStep = 'confirm';
+    }
+
+    await getStore(env).put(`task:${task.taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
+    await deleteMessage(chatId, msgId, env).catch(() => {});
+    await openGhReleaseWizard(task, nextStep, env);
+    return;
   }
 }
 
@@ -3910,6 +4562,215 @@ async function handleCallbackQuery(cb, env) {
     }
   }
 
+  if (data === 'gh_login_repo') {
+    await answerCb(cb.id, 'Loading repositories...', false, env);
+    await getStore(env).delete(promptKey(chatId, userId));
+    await openGhRepoBrowser(chatId, userId, msgId, null, env, 0, threadId);
+    return;
+  }
+
+  if (data === 'gh_login_disconnect') {
+    await getStore(env).delete(promptKey(chatId, userId));
+    const stored = await getUserProfile(userId, env);
+    if (stored) {
+      if (hasDriveAuth(stored)) {
+        stored.ghPat = '';
+        stored.ghUser = '';
+        stored.ghScopes = '';
+        stored.ghRepo = '';
+        if (stored.defaultDest === 'ghrelease') stored.defaultDest = 'gdrive';
+        await saveUserProfile(userId, stored, env);
+      } else {
+        await getStore(env).delete(`user:${userId}`);
+      }
+    }
+    await answerCb(cb.id, 'GitHub disconnected', false, env);
+    await editMessage(chatId, msgId, `<blockquote><b>GitHub Disconnected</b>\n\nYour PAT has been removed. Use /ghlogin anytime to reconnect.</blockquote>`, env);
+    return;
+  }
+
+  if (data.startsWith('ghr_')) {
+    const raw = await getStore(env).get(`ghbrowser:${userId}`);
+    if (!raw) {
+      await answerCb(cb.id, 'Repository picker expired. Open Select Repo again.', true, env);
+      return;
+    }
+    const gState = JSON.parse(raw);
+
+    if (data === 'ghr_noop') {
+      await answerCb(cb.id, '', false, env);
+      return;
+    }
+    if (data === 'ghr_close') {
+      await getStore(env).delete(`ghbrowser:${userId}`);
+      await deleteMessage(chatId, msgId, env);
+      await answerCb(cb.id, 'Closed', false, env);
+      return;
+    }
+    if (data.startsWith('ghr_page:')) {
+      const nextPage = parseInt(data.split(':')[1], 10);
+      await answerCb(cb.id, `Page ${nextPage + 1}`, false, env);
+      await renderGhRepoBrowserPage(chatId, userId, gState, nextPage, msgId, env);
+      return;
+    }
+    if (data === 'ghr_manual') {
+      await getStore(env).put(
+        promptKey(chatId, userId),
+        JSON.stringify({
+          type: 'gh_repo_manual',
+          browserMsgId: msgId,
+          returnTaskId: gState.returnTaskId
+        }),
+        { expirationTtl: 600 }
+      );
+      await answerCb(cb.id, 'Send owner/repo', false, env);
+      await sendMessage(
+        chatId,
+        `<blockquote><b>Type Repository</b></blockquote>\n\nSend <code>owner/repo</code> (e.g. <code>Another-yashu-2/releases</code>), or /cancel:`,
+        env,
+        null,
+        null,
+        gState.threadId || threadId
+      );
+      return;
+    }
+    if (data.startsWith('ghr_sel:')) {
+      const idx = parseInt(data.split(':')[1], 10);
+      const repo = gState.repos[idx];
+      if (!repo) {
+        await answerCb(cb.id, 'Repository not found', true, env);
+        return;
+      }
+      const profile = await getUserProfile(userId, env);
+      if (profile) {
+        profile.ghRepo = repo.fullName;
+        await saveUserProfile(userId, profile, env);
+      }
+
+      if (gState.returnTaskId) {
+        const tRaw = await getStore(env).get(`task:${gState.returnTaskId}`);
+        if (tRaw) {
+          const task = JSON.parse(tRaw);
+          if (await canControlRecord(task, userId, env)) {
+            task.dest = 'ghrelease';
+            task.hasGithub = true;
+            task.ghUser = profile?.ghUser || task.ghUser;
+            task.ghRepo = repo.fullName;
+            task.folderId = '';
+            task.folderName = repo.fullName;
+            task.share = false;
+            task.duplicateExists = false;
+            await getStore(env).put(`task:${task.taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
+            await answerCb(cb.id, `Repo: ${repo.fullName}`, false, env);
+            await editMessage(chatId, msgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
+            return;
+          }
+        }
+      }
+
+      await answerCb(cb.id, `Default Repo: ${repo.fullName}`, false, env);
+      await editMessage(
+        chatId,
+        msgId,
+        `<blockquote><b>Default GitHub Repository Updated</b></blockquote>\n\n` +
+          `Repository  ·  <code>${escapeHtml(repo.fullName)}</code>\n\n` +
+          `Change anytime  ·  /ghlogin`,
+        env
+      );
+      return;
+    }
+    if (data.startsWith('ghr_back:')) {
+      const tid = data.split(':')[1];
+      const tRaw = await getStore(env).get(`task:${tid}`);
+      if (tRaw) {
+        const task = JSON.parse(tRaw);
+        if (await canControlRecord(task, userId, env)) {
+          await editMessage(chatId, msgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
+        }
+      }
+      await answerCb(cb.id, 'Returned to task', false, env);
+      return;
+    }
+  }
+
+  if (data.startsWith('ghrel_')) {
+    const parts = data.split(':');
+    const action = parts[0];
+    const tid = parts[1];
+    const arg = parts[2] || '';
+    const tRaw = await getStore(env).get(`task:${tid}`);
+    if (!tRaw) {
+      await answerCb(cb.id, 'Task session expired.', true, env);
+      return;
+    }
+    const task = JSON.parse(tRaw);
+    if (!(await canControlRecord(task, userId, env))) {
+      await answerCb(cb.id, 'Only the task initiator can configure this release.', true, env);
+      return;
+    }
+
+    if (action === 'ghrel_step') {
+      await answerCb(cb.id, '', false, env);
+      await openGhReleaseWizard(task, arg || 'tag', env, msgId);
+      return;
+    }
+    if (action === 'ghrel_auto') {
+      if (arg === 'tag') {
+        task.ghTag = task.ghTag || defaultGhAutoTag();
+        await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
+        await answerCb(cb.id, `Tag: ${task.ghTag}`, false, env);
+        await openGhReleaseWizard(task, 'title', env, msgId);
+        return;
+      }
+      if (arg === 'title') {
+        task.ghTitle = task.ghTitle || task.customName || task.detectedName || task.ghTag || defaultGhAutoTag();
+        await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
+        await answerCb(cb.id, 'Using default title', false, env);
+        await openGhReleaseWizard(task, 'notes', env, msgId);
+        return;
+      }
+      if (arg === 'skipnotes') {
+        task.ghNotes = '';
+        task.ghGenerateNotes = false;
+        await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
+        await answerCb(cb.id, 'Notes skipped', false, env);
+        await openGhReleaseWizard(task, 'confirm', env, msgId);
+        return;
+      }
+      if (arg === 'gennotes') {
+        task.ghNotes = '';
+        task.ghGenerateNotes = true;
+        await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
+        await answerCb(cb.id, 'Auto-generated notes selected', false, env);
+        await openGhReleaseWizard(task, 'confirm', env, msgId);
+        return;
+      }
+    }
+    if (action === 'ghrel_pre') {
+      task.ghPrerelease = !task.ghPrerelease;
+      await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
+      await answerCb(cb.id, `Pre-release: ${task.ghPrerelease ? 'ON' : 'OFF'}`, false, env);
+      await openGhReleaseWizard(task, 'confirm', env, msgId);
+      return;
+    }
+    if (action === 'ghrel_draft') {
+      task.ghDraft = !task.ghDraft;
+      await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
+      await answerCb(cb.id, `Draft: ${task.ghDraft ? 'ON' : 'OFF'}`, false, env);
+      await openGhReleaseWizard(task, 'confirm', env, msgId);
+      return;
+    }
+    if (action === 'ghrel_launch') {
+      await getStore(env).delete(promptKey(chatId, userId));
+      task.ghTag = task.ghTag || defaultGhAutoTag();
+      task.ghTitle = task.ghTitle || task.customName || task.detectedName || task.ghTag;
+      await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
+      await answerCb(cb.id, 'Starting GitHub Release upload...', false, env);
+      await launchMirrorTask(task, env);
+      return;
+    }
+  }
+
   if (data.startsWith('tm_try_yt:')) {
     const retryId = data.split(':')[1];
     const rRaw = await getStore(env).get(`retry:${retryId}`);
@@ -4195,65 +5056,31 @@ async function handleCallbackQuery(cb, env) {
     if (action === 'tm_dest') {
       const profile = await getUserProfile(userId, env);
       const canUseSharedGc = !!(task.chatType && task.chatType !== 'private' && task.driveFolderId && !hasDriveAuth(profile));
-      if (!hasDriveAuth(profile) && !canUseSharedGc) {
-        if (task.dest === 'gofile') {
-          task.dest = 'telegram';
-          task.isSharedGcTemp = false;
-          task.folderId = '';
-          task.folderName = 'Telegram (Leech)';
-        } else {
-          task.dest = 'gofile';
-          task.isSharedGcTemp = false;
-          task.folderId = '';
-          task.folderName = 'Gofile (Guest)';
-        }
-        task.duplicateExists = false;
-        await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
-        await editMessage(chatId, msgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
-        await answerCb(cb.id, `Destination: ${task.dest === 'telegram' ? 'Telegram (Leech)' : 'Gofile (Temp)'}`, false, env);
-        return;
-      }
+      const userHasDrive = hasDriveAuth(profile);
+      const userHasGh = hasGithubAuth(profile);
 
-      if (canUseSharedGc) {
-        if (task.dest === 'gdrive') {
-          task.dest = 'gofile';
-          task.isSharedGcTemp = false;
-          task.folderId = '';
-          task.folderName = 'Gofile (Guest)';
-          task.duplicateExists = false;
-        } else if (task.dest === 'gofile') {
-          task.dest = 'telegram';
-          task.isSharedGcTemp = false;
-          task.folderId = '';
-          task.folderName = 'Telegram (Leech)';
-          task.duplicateExists = false;
-        } else {
-          task.dest = 'gdrive';
+      const destOrder = [];
+      if (userHasDrive || canUseSharedGc) destOrder.push('gdrive');
+      destOrder.push('gofile', 'telegram');
+      if (userHasGh) destOrder.push('ghrelease');
+
+      const curIdx = destOrder.indexOf(task.dest);
+      const nextDest = destOrder[(curIdx + 1) % destOrder.length];
+
+      if (nextDest === 'gdrive') {
+        task.dest = 'gdrive';
+        if (canUseSharedGc) {
           task.isSharedGcTemp = true;
+          task.hasDrive = false;
           task.folderId = task.driveFolderId;
           task.folderName = task.driveFolderName || GC_TEMP_FOLDER_NAME;
           task.share = true;
-        }
-      } else {
-        task.hasDrive = true;
-        task.isSharedGcTemp = false;
-        task.credUserId = String(userId);
-        if (task.dest === 'gdrive') {
-          task.dest = 'gofile';
-          task.driveFolderId = task.folderId || profile.folderId || 'root';
-          task.driveFolderName = task.folderName || profile.folderName || 'My Drive';
-          task.folderId = '';
-          task.folderName = 'Gofile (Guest)';
-          task.duplicateExists = false;
-        } else if (task.dest === 'gofile') {
-          task.dest = 'telegram';
-          task.folderId = '';
-          task.folderName = 'Telegram (Leech)';
-          task.duplicateExists = false;
         } else {
-          task.dest = 'gdrive';
-          task.folderId = task.driveFolderId || profile.folderId || 'root';
-          task.folderName = task.driveFolderName || profile.folderName || 'My Drive';
+          task.hasDrive = true;
+          task.isSharedGcTemp = false;
+          task.credUserId = String(userId);
+          task.folderId = task.driveFolderId || profile?.folderId || 'root';
+          task.folderName = task.driveFolderName || profile?.folderName || 'My Drive';
           if (!task.batch) {
             const accessToken = await getValidAccessToken(userId, env);
             if (accessToken) {
@@ -4262,10 +5089,56 @@ async function handleCallbackQuery(cb, env) {
             }
           }
         }
+      } else if (nextDest === 'gofile') {
+        task.dest = 'gofile';
+        task.isSharedGcTemp = false;
+        if (userHasDrive && task.folderId && task.folderId !== '') {
+          task.driveFolderId = task.folderId;
+          task.driveFolderName = task.folderName || profile?.folderName || 'My Drive';
+        }
+        task.folderId = '';
+        task.folderName = 'Gofile (Guest)';
+        task.duplicateExists = false;
+      } else if (nextDest === 'telegram') {
+        task.dest = 'telegram';
+        task.isSharedGcTemp = false;
+        task.folderId = '';
+        task.folderName = 'Telegram (Leech)';
+        task.duplicateExists = false;
+      } else if (nextDest === 'ghrelease') {
+        task.dest = 'ghrelease';
+        task.isSharedGcTemp = false;
+        task.hasGithub = true;
+        task.ghUser = profile.ghUser;
+        if (!task.ghRepo) task.ghRepo = profile.ghRepo || '';
+        task.folderId = '';
+        task.folderName = task.ghRepo || 'GitHub Release';
+        task.share = false;
+        task.duplicateExists = false;
       }
+
       await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
       await editMessage(chatId, msgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
-      await answerCb(cb.id, `Destination: ${task.dest === 'telegram' ? 'Telegram (Leech)' : (task.dest === 'gofile' ? 'Gofile (Temp)' : (task.isSharedGcTemp ? 'GC Drive (5d)' : 'Google Drive'))}`, false, env);
+      const destToast = task.dest === 'ghrelease'
+        ? 'GitHub Release'
+        : task.dest === 'telegram'
+          ? 'Telegram (Leech)'
+          : task.dest === 'gofile'
+            ? 'Gofile (Temp)'
+            : (task.isSharedGcTemp ? 'GC Drive (5d)' : 'Google Drive');
+      await answerCb(cb.id, `Destination: ${destToast}`, false, env);
+      return;
+    }
+
+    if (action === 'tm_ghrepo') {
+      const profile = await getUserProfile(userId, env);
+      if (!hasGithubAuth(profile)) {
+        await answerCb(cb.id, 'Connect GitHub first with /ghlogin', true, env);
+        await sendGhLoginScreen(chatId, userId, env, { threadId: task.threadId || threadId, isGroup: task.chatType !== 'private' });
+        return;
+      }
+      await answerCb(cb.id, 'Loading GitHub Repositories', false, env);
+      await openGhRepoBrowser(chatId, userId, msgId, tid, env, 0, task.threadId || threadId);
       return;
     }
 
@@ -4323,6 +5196,25 @@ async function handleCallbackQuery(cb, env) {
     }
 
     if (action === 'tm_start') {
+      if (task.dest === 'ghrelease') {
+        const ghProfile = await getUserProfile(userId, env);
+        if (!hasGithubAuth(ghProfile)) {
+          await answerCb(cb.id, 'Connect GitHub first with /ghlogin', true, env);
+          await sendGhLoginScreen(chatId, userId, env, { threadId: task.threadId || threadId, isGroup: task.chatType !== 'private' });
+          return;
+        }
+        task.ghUser = ghProfile.ghUser;
+        if (!task.ghRepo) task.ghRepo = ghProfile.ghRepo || '';
+        if (!task.ghRepo) {
+          await answerCb(cb.id, 'Select a target repository first', false, env);
+          await openGhRepoBrowser(chatId, userId, msgId, tid, env, 0, task.threadId || threadId);
+          return;
+        }
+        await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
+        await answerCb(cb.id, 'Configure release details', false, env);
+        await openGhReleaseWizard(task, 'tag', env, msgId);
+        return;
+      }
       await answerCb(cb.id, 'Starting...', false, env);
       await launchMirrorTask(task, env);
       return;
@@ -4406,19 +5298,30 @@ async function handleCallbackQuery(cb, env) {
     const stored = await getUserProfile(userId, env);
     const profile = getEffectiveProfile(userId, stored);
     if (data === 'cfg_toggle_dest') {
-      if (hasDriveAuth(stored)) {
-        const order = ['gdrive', 'gofile', 'telegram'];
-        const curIdx = order.indexOf(profile.defaultDest);
-        profile.defaultDest = order[(curIdx + 1) % order.length];
-      } else {
-        profile.defaultDest = profile.defaultDest === 'telegram' ? 'gofile' : 'telegram';
-      }
+      const order = [];
+      if (hasDriveAuth(stored)) order.push('gdrive');
+      order.push('gofile', 'telegram');
+      if (hasGithubAuth(stored)) order.push('ghrelease');
+      const curIdx = order.indexOf(profile.defaultDest);
+      profile.defaultDest = order[(curIdx + 1) % order.length];
       await saveUserProfile(userId, profile, env);
-      const label = profile.defaultDest === 'telegram'
-        ? 'Telegram (Leech)'
-        : (profile.defaultDest === 'gofile' ? 'Gofile (Temp)' : 'Google Drive');
+      const label = profile.defaultDest === 'ghrelease'
+        ? 'GitHub Release'
+        : profile.defaultDest === 'telegram'
+          ? 'Telegram (Leech)'
+          : (profile.defaultDest === 'gofile' ? 'Gofile (Temp)' : 'Google Drive');
       await answerCb(cb.id, `Default Dest: ${label}`, false, env);
       await sendSettingsMenu(chatId, userId, profile, msgId, env, threadId);
+      return;
+    }
+    if (data === 'cfg_ghrepo') {
+      if (!hasGithubAuth(stored)) {
+        await answerCb(cb.id, 'Connect GitHub first with /ghlogin', true, env);
+        await sendGhLoginScreen(chatId, userId, env, { threadId });
+        return;
+      }
+      await answerCb(cb.id, 'Loading GitHub repositories...', false, env);
+      await openGhRepoBrowser(chatId, userId, msgId, null, env, 0, threadId);
       return;
     }
     if (data === 'cfg_toggle_asdoc') {
@@ -4564,12 +5467,34 @@ async function handleCallbackQuery(cb, env) {
 async function launchMirrorTask(task, env) {
   const { chatId, userId, taskId, menuMsgId } = task;
   const credUserId = String(task.credUserId || userId);
-  const dest = task.dest === 'gofile' ? 'gofile' : (task.dest === 'telegram' ? 'telegram' : 'gdrive');
+  const dest = ['gofile', 'telegram', 'ghrelease'].includes(task.dest) ? task.dest : 'gdrive';
   const isGofile = dest === 'gofile';
   const isLeech = dest === 'telegram';
-  const accessToken = !isGofile ? await getValidAccessToken(credUserId, env) : null;
+  const isGhRelease = dest === 'ghrelease';
+  const needsDrive = !isGofile && !isLeech && !isGhRelease;
 
-  if (!isGofile && !isLeech && !accessToken) {
+  let ghProfile = null;
+  if (isGhRelease) {
+    ghProfile = await getUserProfile(userId, env);
+    if (!hasGithubAuth(ghProfile)) {
+      await editMessage(
+        chatId,
+        menuMsgId,
+        `<blockquote><b>GitHub Not Connected</b>\n\nPlease connect your GitHub PAT with /ghlogin first.</blockquote>`,
+        env
+      );
+      return;
+    }
+    if (!task.ghRepo) task.ghRepo = ghProfile.ghRepo || '';
+    if (!task.ghRepo) {
+      await openGhRepoBrowser(chatId, userId, menuMsgId, taskId, env, 0, task.threadId || null);
+      return;
+    }
+  }
+
+  const accessToken = needsDrive ? await getValidAccessToken(credUserId, env) : null;
+
+  if (needsDrive && !accessToken) {
     await editMessage(
       chatId,
       menuMsgId,
@@ -4581,10 +5506,10 @@ async function launchMirrorTask(task, env) {
     return;
   }
 
-  const quota = (!isGofile && !isLeech && accessToken) ? await getDriveQuota(accessToken) : null;
+  const quota = (needsDrive && accessToken) ? await getDriveQuota(accessToken) : null;
   const fileSize = task.fileSize || 0;
 
-  if (!isGofile && !isLeech && !task.batch && fileSize > 0 && quota && quota.free !== Infinity && fileSize > quota.free) {
+  if (needsDrive && !task.batch && fileSize > 0 && quota && quota.free !== Infinity && fileSize > quota.free) {
     const msg =
       `<blockquote><b>Insufficient Drive Storage</b>\n\n` +
       `<code>${escapeHtml(task.customName || task.detectedName)}</code></blockquote>\n\n` +
@@ -4597,7 +5522,7 @@ async function launchMirrorTask(task, env) {
 
   // Fast server-side copy directly in Worker for single Drive file in normal mode
   const singleItem = !task.batch && task.items?.length === 1 ? task.items[0] : null;
-  if (!isGofile && !isLeech && singleItem && singleItem.type === 'gdrive' && !task.isFolder && task.mode === 'normal') {
+  if (needsDrive && singleItem && singleItem.type === 'gdrive' && !task.isFolder && task.mode === 'normal') {
     await executeDirectDriveCopy(task, singleItem, accessToken, env);
     return;
   }
@@ -4627,21 +5552,27 @@ async function launchMirrorTask(task, env) {
   }
 
   const modeTag = task.isYtdl
-    ? (YT_AUDIO_QUALITIES.has(task.ytQuality) ? '#Audio' : '#ytdlp') + (isLeech ? ' #Leech' : '')
-    : (isLeech
-        ? (task.mode === 'extract' ? '#Extract #Leech' : task.mode === 'zip' ? '#ZIP #Leech' : '#Leech')
-        : (task.mode === 'extract' ? '#Extract' : task.mode === 'zip' ? '#ArchiveZIP' : '#Mirror'));
+    ? (YT_AUDIO_QUALITIES.has(task.ytQuality) ? '#Audio' : '#ytdlp') + (isLeech ? ' #Leech' : isGhRelease ? ' #GHRelease' : '')
+    : (isGhRelease
+        ? (task.mode === 'extract' ? '#Extract #GHRelease' : task.mode === 'zip' ? '#ZIP #GHRelease' : '#GHRelease')
+        : isLeech
+          ? (task.mode === 'extract' ? '#Extract #Leech' : task.mode === 'zip' ? '#ZIP #Leech' : '#Leech')
+          : (task.mode === 'extract' ? '#Extract' : task.mode === 'zip' ? '#ArchiveZIP' : '#Mirror'));
   const freeDriveStr = quota && quota.free !== Infinity ? fmtBytes(quota.free) : 'Unlimited';
   const actionsUrl = getActionsUrl(env) || 'https://github.com';
   const displayTitle = task.batch
     ? `Batch (${task.items.length} links)`
     : (task.customName || task.detectedName);
 
-  const destLines = isLeech
-    ? `├ Dest : Telegram (Leech)\n├ Part Limit : <code>2.00 GB (Auto Split)</code>\n`
-    : isGofile
-      ? `├ Dest : Gofile (Fresh Guest)\n├ Quota : <code>100GB DL / 10d idle</code>\n`
-      : `├ Folder : ${escapeHtml(task.isSharedGcTemp ? 'GC Shared (5-Day Temp)' : task.folderName)}\n├ Drive Free : <code>${freeDriveStr}</code>\n`;
+  const ghTagFinal = isGhRelease ? (task.ghTag || defaultGhAutoTag()) : '';
+  const ghTitleFinal = isGhRelease ? (task.ghTitle || displayTitle || ghTagFinal) : '';
+  const destLines = isGhRelease
+    ? `├ Dest : GitHub Release (<code>${escapeHtml(task.ghRepo)}</code>)\n├ Tag : <code>${escapeHtml(ghTagFinal)}</code>\n`
+    : isLeech
+      ? `├ Dest : Telegram (Leech)\n├ Part Limit : <code>2.00 GB (Auto Split)</code>\n`
+      : isGofile
+        ? `├ Dest : Gofile (Fresh Guest)\n├ Quota : <code>100GB DL / 10d idle</code>\n`
+        : `├ Folder : ${escapeHtml(task.isSharedGcTemp ? 'GC Shared (5-Day Temp)' : task.folderName)}\n├ Drive Free : <code>${freeDriveStr}</code>\n`;
 
   const userRole = task.userRole || await getUserRoleTag(userId, !!task.isChannel, env);
   const displayBy = /^[a-zA-Z0-9_]{4,}$/.test(String(task.username || '')) ? `@${task.username}` : (task.username || 'User');
@@ -4700,12 +5631,22 @@ async function launchMirrorTask(task, env) {
     fileSize: task.fileSize,
     dest,
     leechAsDoc: !!task.leechAsDoc,
-    folderId: (isGofile || isLeech) ? '' : task.folderId,
-    folderName: isLeech ? 'Telegram (Leech)' : (isGofile ? 'Gofile (Guest)' : task.folderName),
+    ghRepo: isGhRelease ? (task.ghRepo || '') : '',
+    ghUser: isGhRelease ? (ghProfile?.ghUser || task.ghUser || '') : '',
+    ghTag: isGhRelease ? ghTagFinal : '',
+    ghTitle: isGhRelease ? ghTitleFinal : '',
+    ghNotes: isGhRelease ? (task.ghNotes || '') : '',
+    ghPrerelease: isGhRelease ? !!task.ghPrerelease : false,
+    ghDraft: isGhRelease ? !!task.ghDraft : false,
+    ghGenerateNotes: isGhRelease ? !!task.ghGenerateNotes : false,
+    folderId: (isGofile || isLeech || isGhRelease) ? '' : task.folderId,
+    folderName: isGhRelease
+      ? (task.ghRepo || 'GitHub Release')
+      : (isLeech ? 'Telegram (Leech)' : (isGofile ? 'Gofile (Guest)' : task.folderName)),
     mode: task.mode,
     selectFilter: task.selectFilter,
     archivePassword: task.archivePassword || '',
-    share: isLeech ? false : (task.isSharedGcTemp ? true : !!task.share),
+    share: (isLeech || isGhRelease) ? false : (task.isSharedGcTemp ? true : !!task.share),
     conflict: task.conflict || 'rename',
     isYtdl: !!task.isYtdl,
     ytQuality: task.ytQuality || 'best',
@@ -4948,14 +5889,24 @@ async function handleInternalRunner(request, path, env) {
       job.status = 'running';
       await getStore(env).put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 25200 });
     }
-    const tokenInfo = await getValidTokenInfo(credUid, env, false);
-    if (job.dest !== 'gofile' && job.dest !== 'telegram' && !tokenInfo) {
+    const needsDrive = !['gofile', 'telegram', 'ghrelease'].includes(job.dest);
+    const tokenInfo = needsDrive ? await getValidTokenInfo(credUid, env, false) : null;
+    if (needsDrive && !tokenInfo) {
       return jsonResponse({ ok: false, error: 'Could not mint Google access token for user' }, 400);
+    }
+    let ghPat = '';
+    if (job.dest === 'ghrelease') {
+      const ghProfile = await getUserProfile(job.userId, env);
+      if (!ghProfile?.ghPat) {
+        return jsonResponse({ ok: false, error: 'User GitHub PAT missing. Reconnect via /ghlogin.' }, 400);
+      }
+      ghPat = ghProfile.ghPat;
     }
     return jsonResponse({
       ok: true,
       job: {
         ...job,
+        ghPat,
         accessToken: tokenInfo?.accessToken || '',
         tokenExpiry: tokenInfo?.tokenExpiry || null
       }
@@ -5005,7 +5956,7 @@ async function handleInternalRunner(request, path, env) {
           direct: it.direct || '',
           size: it.size || 0,
           status: it.status,
-          mode: job.dest === 'telegram' ? 'leech' : (job.mode || 'normal'),
+          mode: job.dest === 'ghrelease' ? 'ghrelease' : (job.dest === 'telegram' ? 'leech' : (job.mode || 'normal')),
           shared: !!it.shared,
           ts: Date.now()
         }));
@@ -5224,9 +6175,11 @@ async function sendActiveTasks(chatId, userId, env, _filterChatId = null, thread
     const state = escapeHtml(j.status || 'starting');
     const userTag = j.username ? `@${escapeHtml(j.username)}` : `<code>${escapeHtml(String(j.userId || userId))}</code>`;
     const folder = escapeHtml(
-      j.dest === 'telegram'
-        ? 'Telegram (Leech)'
-        : (j.dest === 'gofile' ? 'Gofile (Guest)' : (j.isSharedGcTemp ? 'GC Shared (5-Day Temp)' : (j.folderName || 'My Drive')))
+      j.dest === 'ghrelease'
+        ? `GitHub (${j.ghRepo || 'Release'})`
+        : j.dest === 'telegram'
+          ? 'Telegram (Leech)'
+          : (j.dest === 'gofile' ? 'Gofile (Guest)' : (j.isSharedGcTemp ? 'GC Shared (5-Day Temp)' : (j.folderName || 'My Drive')))
     );
 
     const cardText = j.lastCardHtml || (
@@ -5281,16 +6234,19 @@ async function sendStartScreen(chatId, userId, username, env, opts = {}) {
   const profile = getEffectiveProfile(userId, stored);
   const osNote = buildOpenSourceNoteHtml(env);
 
+  const hasGh = hasGithubAuth(stored);
+  const ghSummary = hasGh ? `\n\nGitHub Release  ·  <b>@${escapeHtml(stored.ghUser)}</b> (<code>${escapeHtml(stored.ghRepo || 'No repo picked')}</code>)` : '';
+
   if (!hasDriveAuth(stored)) {
     const gcInfo = isGroup
-      ? `Default GC Dest  ·  <b>${profile.defaultDest === 'telegram' ? 'Telegram (Leech)' : 'Shared Group Drive (5-Day Auto-Delete)'}</b>\n\n<i>Tip: Run /login to connect your own Google Drive for permanent storage.</i>\n\n`
-      : `Destination  ·  <b>${profile.defaultDest === 'telegram' ? 'Telegram (Leech)' : 'Gofile (No Login Required)'}</b>\n\n`;
+      ? `Default GC Dest  ·  <b>${profile.defaultDest === 'ghrelease' ? 'GitHub Release' : (profile.defaultDest === 'telegram' ? 'Telegram (Leech)' : 'Shared Group Drive (5-Day Auto-Delete)')}</b>${ghSummary}\n\n<i>Tip: Run /login for personal Drive or /ghlogin for GitHub Releases.</i>\n\n`
+      : `Destination  ·  <b>${profile.defaultDest === 'ghrelease' ? 'GitHub Release' : (profile.defaultDest === 'telegram' ? 'Telegram (Leech)' : 'Gofile (No Login Required)')}</b>${ghSummary}\n\n`;
     const text =
       `<blockquote><b>Cloud Mirror &amp; Leech Engine</b>\n\n` +
-      `Free On-Demand Mirroring &amp; Leeching (Telegram + Gofile + Google Drive)</blockquote>\n\n` +
+      `Free On-Demand Mirroring &amp; Leeching (Telegram + Gofile + GitHub Release + Google Drive)</blockquote>\n\n` +
       gcInfo +
       `Bandwidth  ·  Up to <code>1.8 Gbps</code> (16x Aria2c)\n\n` +
-      `Features  ·  Direct URLs · Telegram Files (&lt;4GB) · Auto Split (&gt;2GB) · yt-dlp · Batch · Extract · ZIP\n\n` +
+      `Features  ·  Direct URLs · Telegram Files (&lt;4GB) · GitHub Releases · Auto Split (&gt;2GB) · yt-dlp · Batch · Extract · ZIP\n\n` +
       `Telemetry  ·  <code>2.5s</code> Live Progress &amp; System Stats\n\n` +
       `${osNote}\n\n` +
       `<b>Commands</b>\n\n` +
@@ -5298,7 +6254,7 @@ async function sendStartScreen(chatId, userId, username, env, opts = {}) {
       `<code>/leech &lt;link&gt;</code> (<code>/l</code>) — Leech files directly into Telegram (auto-splits &gt; 2 GB)\n\n` +
       `<code>/yt &lt;link&gt;</code> — Download videos / audio / playlists via yt-dlp\n\n` +
       `/help — Full guide    /tasks — Active transfers    /history — Recent transfers\n\n` +
-      `/settings — Preferences    /login — Connect Google Drive (Permanent)`;
+      `/settings — Preferences    /login — Connect Google Drive    /ghlogin — Connect GitHub`;
 
     if (isGroup) {
       await sendMessage(chatId, text, env, null, replyToMsgId, threadId);
@@ -5316,14 +6272,17 @@ async function sendStartScreen(chatId, userId, username, env, opts = {}) {
     return;
   }
 
-  const destLabel = profile.defaultDest === 'telegram'
-    ? 'Telegram (Leech)'
-    : (profile.defaultDest === 'gofile' ? 'Gofile (Temp Guest)' : 'Google Drive (Permanent)');
+  const destLabel = profile.defaultDest === 'ghrelease'
+    ? `GitHub Release (${profile.ghRepo || 'No repo picked'})`
+    : profile.defaultDest === 'telegram'
+      ? 'Telegram (Leech)'
+      : (profile.defaultDest === 'gofile' ? 'Gofile (Temp Guest)' : 'Google Drive (Permanent)');
   const text =
     `<blockquote><b>Cloud Mirror &amp; Leech Engine</b>\n\n` +
     `<code>${escapeHtml(profile.email)}</code></blockquote>\n\n` +
-    `Default Dest  ·  ${destLabel}\n\n` +
-    `Upload Folder  ·  ${escapeHtml(profile.folderName || 'My Drive')}\n\n` +
+    `Default Dest  ·  ${escapeHtml(destLabel)}\n\n` +
+    `Upload Folder  ·  ${escapeHtml(profile.folderName || 'My Drive')}` +
+    `${ghSummary}\n\n` +
     `Options Menu  ·  ${profile.buttonMode !== false ? 'Enabled' : 'Disabled'}\n\n` +
     `Auto Share  ·  ${profile.autoShare ? 'Enabled' : 'Disabled'}    Duplicate  ·  ${conflictLabel(profile.conflict || 'rename')}\n\n` +
     `${osNote}\n\n` +
@@ -5331,7 +6290,7 @@ async function sendStartScreen(chatId, userId, username, env, opts = {}) {
     `<code>/m &lt;link&gt;</code> — Mirror URLs, Drive links, Telegram files, or <code>t.me</code> links\n\n` +
     `<code>/leech &lt;link&gt;</code> (<code>/l</code>) — Leech files directly into Telegram (auto-splits &gt; 2 GB)\n\n` +
     `<code>/yt &lt;link&gt;</code> — Download videos / audio / playlists via yt-dlp\n\n` +
-    `/setdldir — Browse &amp; select target folder\n\n` +
+    `/setdldir — Browse &amp; select target folder    /ghlogin — Connect GitHub Releases\n\n` +
     `/tasks — Active transfers    /history — Recent transfers\n\n` +
     `/settings — Preferences    /help — Full guide    /logout — Unlink Drive`;
 
@@ -5380,6 +6339,8 @@ async function sendHelpScreen(chatId, userId, env, opts = {}) {
     `<code>/yt &lt;url&gt;</code> — Download videos, audio, or playlists (YouTube, Instagram, TikTok, X, etc.)\n\n` +
     `<b>Account &amp; Preferences</b>\n\n` +
     `/login — Connect your personal Google Drive (works in both DMs &amp; Groups)\n\n` +
+    `/ghlogin — Connect your GitHub account via PAT to upload GitHub Releases\n\n` +
+    `/ghlogout — Unlink your GitHub PAT\n\n` +
     `/setdldir — Pick your default Drive upload folder\n\n` +
     `/settings — Configure default destination, Leech type, ButtonMode, Auto Share, Duplicate policy &amp; yt-dlp presets\n\n` +
     `/logout — Unlink your Google Drive\n\n` +
@@ -5409,18 +6370,25 @@ async function sendHelpScreen(chatId, userId, env, opts = {}) {
 
 async function sendSettingsMenu(chatId, userId, profile, editMsgId, env, threadId = null) {
   const hasDrive = hasDriveAuth(profile);
+  const hasGithub = hasGithubAuth(profile);
   const eff = getEffectiveProfile(userId, profile);
   const yq = ytQualityLabel(eff.ytQuality || 'best');
   const yc = ytContainerLabel(eff.ytContainer || 'mp4');
-  const destStr = eff.defaultDest === 'telegram'
-    ? 'Telegram (Leech to Chat)'
-    : (eff.defaultDest === 'gofile' ? 'Gofile (Temp · Fresh Guest)' : 'Google Drive (Permanent)');
+  const destStr = eff.defaultDest === 'ghrelease'
+    ? `GitHub Release (${eff.ghRepo || 'No repo picked'})`
+    : eff.defaultDest === 'telegram'
+      ? 'Telegram (Leech to Chat)'
+      : (eff.defaultDest === 'gofile' ? 'Gofile (Temp · Fresh Guest)' : 'Google Drive (Permanent)');
   const leechModeStr = eff.leechAsDoc ? 'Document (Original File)' : 'Media (Stream Video / Audio)';
   const acctLine = hasDrive ? `<code>${escapeHtml(eff.email)}</code>` : `<i>Guest Mode (No Google Drive Linked)</i>`;
+  const ghLine = hasGithub
+    ? `GitHub Release  ·  <b>@${escapeHtml(eff.ghUser)}</b> (<code>${escapeHtml(eff.ghRepo || 'Not selected')}</code>)\n\n`
+    : `GitHub Release  ·  <i>Not linked (/ghlogin)</i>\n\n`;
   const text =
     `<blockquote><b>Preferences</b>\n\n` +
     `${acctLine}</blockquote>\n\n` +
-    `Default Dest  ·  ${destStr}\n\n` +
+    `Default Dest  ·  ${escapeHtml(destStr)}\n\n` +
+    `${ghLine}` +
     `Leech Upload As  ·  ${leechModeStr}\n\n` +
     (hasDrive ? `Target Folder  ·  ${escapeHtml(eff.folderName || 'My Drive')}\n\n` : '') +
     `ButtonMode  ·  ${eff.buttonMode !== false ? 'Enabled' : 'Disabled'}\n\n` +
@@ -5430,16 +6398,27 @@ async function sendSettingsMenu(chatId, userId, profile, editMsgId, env, threadI
       : '') +
     `Media (yt-dlp)  ·  <code>${yq} · ${yc}</code>`;
 
-  const destBtnLabel = eff.defaultDest === 'telegram'
-    ? 'Telegram (Leech)'
-    : (eff.defaultDest === 'gofile' ? 'Gofile' : 'Google Drive');
+  const destBtnLabel = eff.defaultDest === 'ghrelease'
+    ? 'GitHub Release'
+    : eff.defaultDest === 'telegram'
+      ? 'Telegram (Leech)'
+      : (eff.defaultDest === 'gofile' ? 'Gofile' : 'Google Drive');
   const rows = [];
   rows.push([
     { text: `Dest: ${destBtnLabel}`, callback_data: 'cfg_toggle_dest', style: 'primary' },
     { text: `Leech: ${eff.leechAsDoc ? 'Document' : 'Media'}`, callback_data: 'cfg_toggle_asdoc' }
   ]);
-  if (hasDrive) {
+  if (hasDrive && hasGithub) {
+    rows.push([
+      { text: '📁 Drive Folder', callback_data: 'cfg_dir', style: 'primary' },
+      { text: '📦 GitHub Repo', callback_data: 'cfg_ghrepo', style: 'primary' }
+    ]);
+  } else if (hasDrive) {
     rows.push([{ text: 'Browse / Change Folder', callback_data: 'cfg_dir', style: 'primary' }]);
+  } else if (hasGithub) {
+    rows.push([{ text: '📦 Select GitHub Repo', callback_data: 'cfg_ghrepo', style: 'primary' }]);
+  }
+  if (hasDrive) {
     rows.push([
       { text: `ButtonMode: ${eff.buttonMode !== false ? 'ON' : 'OFF'}`, callback_data: 'cfg_toggle_btn' },
       { text: `Auto Share: ${eff.autoShare ? 'ON' : 'OFF'}`, callback_data: 'cfg_toggle_share' }

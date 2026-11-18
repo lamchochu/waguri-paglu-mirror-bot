@@ -58,6 +58,8 @@ TICK_SECONDS = 2.5
 TOKEN_REFRESH_SECONDS = 40 * 60  # Google access tokens live ~60 min
 TG_BOT_MAX_BYTES = 2000 * 1024 * 1024  # Telegram Bot MTProto 2,000 MiB upload limit
 TG_SPLIT_BYTES = 1950 * 1024 * 1024  # Safe < 2,000 MiB volume size for auto-splitting
+GH_ASSET_MAX_BYTES = 2000 * 1024 * 1024  # GitHub Releases 2 GiB single-asset limit
+GH_SPLIT_BYTES = 1950 * 1024 * 1024  # Safe < 2 GiB volume size for GitHub Release assets
 PERM_REQ_MAX_BYTES = 50 * 1024 * 1024 * 1024  # 50 GiB limit for permanent gcusrfiles request button
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi"}
 AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".flac", ".aac", ".ogg", ".wav"}
@@ -1639,11 +1641,25 @@ class Mirror:
         self.message_id = job.get("messageId")
         self.dest = job.get("dest") or "gdrive"
         self.leech_as_doc = bool(job.get("leechAsDoc"))
+        self.gh_pat = (job.get("ghPat") or "").strip()
+        self.gh_repo = (job.get("ghRepo") or "").strip()
+        self.gh_user = (job.get("ghUser") or "").strip()
+        self.gh_tag = (job.get("ghTag") or "").strip()
+        self.gh_title = (job.get("ghTitle") or "").strip()
+        self.gh_notes = job.get("ghNotes") or ""
+        self.gh_prerelease = bool(job.get("ghPrerelease"))
+        self.gh_draft = bool(job.get("ghDraft"))
+        self.gh_generate_notes = bool(job.get("ghGenerateNotes"))
+        self.gh_release_url = ""
         self.folder_id = job.get("folderId") or "root"
         self.folder_name = (
-            "Telegram (Leech)"
-            if self.dest == "telegram"
-            else ("Gofile (Guest)" if self.dest == "gofile" else ("GC Shared (5-Day Temp)" if self.is_shared_gc_temp else (job.get("folderName") or "My Drive")))
+            (self.gh_repo or "GitHub Release")
+            if self.dest == "ghrelease"
+            else (
+                "Telegram (Leech)"
+                if self.dest == "telegram"
+                else ("Gofile (Guest)" if self.dest == "gofile" else ("GC Shared (5-Day Temp)" if self.is_shared_gc_temp else (job.get("folderName") or "My Drive")))
+            )
         )
         self.custom_name = (job.get("customName") or "").strip()
         self.mode = job.get("mode") or "normal"
@@ -1687,6 +1703,7 @@ class Mirror:
         for it in self.items:
             mask_secret(it.get("url", ""))
         mask_secret(self.password, min_len=3)
+        mask_secret(self.gh_pat, min_len=6)
 
     # ---------------- Google token handling ----------------
 
@@ -2311,6 +2328,8 @@ class Mirror:
         }
 
     def upload(self, target: Path):
+        if self.dest == "ghrelease":
+            return self.upload_github_release(target)
         if self.dest == "telegram":
             return self.upload_telegram(target)
         if self.dest == "gofile":
@@ -3131,7 +3150,9 @@ class Mirror:
         hint_name = item.get("name") or ""
         hint_size = int(item.get("size") or 0)
 
-        async with Client(
+        FastClient = self._make_fast_kurigram_client_cls(Client)
+        loop = asyncio.get_running_loop()
+        async with FastClient(
             f"tgdl_{JOB_ID or 'run'}_{self.idx}",
             **_kurigram_client_kwargs(Client, {
                 "api_id": int(TELEGRAM_API_ID),
@@ -3208,11 +3229,13 @@ class Mirror:
 
             t_start = time.time()
             win = [t_start, 0]
+            tick_busy = [False]
+            tick_err = [None]
             self.tick(out_path.name, "Downloading (TG)..", 0.0, 0, real_size, 0, None, "Kurigram MTProto", force=True)
 
             def on_prog(current, total):
                 global cancelled
-                if cancelled:
+                if cancelled or tick_err[0] is not None:
                     app.stop_transmission()
                     return
                 now = time.time()
@@ -3221,18 +3244,29 @@ class Mirror:
                 tot = total or real_size
                 pct = (100.0 * current / tot) if tot > 0 else 0.0
                 eta = ((tot - current) / spd) if spd > 0 and tot > current else None
-                try:
-                    self.tick(out_path.name, "Downloading (TG)..", pct, current, tot, spd, eta, "Kurigram MTProto")
-                except InterruptedError:
-                    cancelled = True
-                    app.stop_transmission()
-                    return
+                if not tick_busy[0] and (now - self.last_tick >= TICK_SECONDS):
+                    tick_busy[0] = True
+                    def _run_tick():
+                        global cancelled
+                        try:
+                            self.tick(out_path.name, "Downloading (TG)..", pct, current, tot, spd, eta, "Kurigram MTProto")
+                        except InterruptedError as ie:
+                            cancelled = True
+                            tick_err[0] = ie
+                        except Exception:
+                            pass
+                        finally:
+                            tick_busy[0] = False
+                    loop.run_in_executor(None, _run_tick)
                 if now - win[0] >= TICK_SECONDS:
                     win[0] = now
                     win[1] = current
 
-            saved = await app.download_media(dl_target, file_name=str(out_path), progress=on_prog)
-            if cancelled:
+            try:
+                saved = await app.download_media(dl_target, file_name=str(out_path), progress=on_prog)
+            finally:
+                await app.close_media_pool()
+            if cancelled or tick_err[0] is not None:
                 raise InterruptedError("Cancelled by user")
             final_p = Path(saved) if saved else out_path
             if not final_p.exists() or final_p.stat().st_size == 0:
@@ -3271,41 +3305,209 @@ class Mirror:
         return self.aria_download(item["url"], dest_dir, out_name=self.single_name(), label=self.item_label(item))
 
     def _make_fast_kurigram_client_cls(self, base_client_cls):
-        """Build a Client subclass with pooled temporary media sessions and fast multi-chunk uploads."""
+        """Build a Client subclass with per-DC pooled temporary media sessions for fast uploads and downloads."""
+        import pyrogram
         from pyrogram import raw
 
         class _FastKurigramClient(base_client_cls):
             def __init__(self_cli, *args, **kwargs):
                 super().__init__(*args, **kwargs)
-                self_cli._media_pool = []
+                self_cli._media_pools = {}
                 self_cli._media_pool_lock = asyncio.Lock()
                 self_cli._preuploaded = {}
                 self_cli._concurrent_hint = 1
 
+            @property
+            def _media_pool(self_cli):
+                return [s for pool in self_cli._media_pools.values() for s in pool]
+
             async def _ensure_media_pool(self_cli, dc_id: int, target_size: int = 6) -> list:
                 async with self_cli._media_pool_lock:
-                    while len(self_cli._media_pool) < target_size:
+                    pool = self_cli._media_pools.setdefault(dc_id, [])
+                    if not pool:
+                        try:
+                            await self_cli.get_session(dc_id)
+                        except Exception:
+                            pass
+                    while len(pool) < target_size:
                         try:
                             sess = await self_cli.get_session(dc_id, is_media=True, temporary=True)
                         except TypeError:
                             sess = await self_cli.get_session(dc_id, is_media=True)
-                            if sess not in self_cli._media_pool:
-                                self_cli._media_pool.append(sess)
+                            if sess not in pool:
+                                pool.append(sess)
                             break
                         except Exception:
                             break
                         if sess is not None:
-                            self_cli._media_pool.append(sess)
-                    return list(self_cli._media_pool)
+                            pool.append(sess)
+                    return list(pool)
 
             async def close_media_pool(self_cli):
-                for sess in list(self_cli._media_pool):
-                    try:
-                        if getattr(sess, "is_started", None):
-                            await sess.stop()
-                    except Exception:
+                for pool in list(self_cli._media_pools.values()):
+                    for sess in list(pool):
+                        try:
+                            if getattr(sess, "is_started", None):
+                                await sess.stop()
+                        except Exception:
+                            pass
+                self_cli._media_pools.clear()
+
+            async def get_file(self_cli, file_id, file_size=0, limit=0, offset=0, progress=None, progress_args=()):
+                try:
+                    from pyrogram.file_id import FileType
+                except Exception:
+                    FileType = None
+
+                file_type = getattr(file_id, "file_type", None)
+                is_chat_photo = (FileType is not None and file_type == FileType.CHAT_PHOTO)
+                if is_chat_photo or limit != 0 or offset != 0 or not file_size or file_size <= 2 * 1024 * 1024:
+                    async for chunk in super().get_file(
+                        file_id, file_size=file_size, limit=limit, offset=offset, progress=progress, progress_args=progress_args
+                    ):
+                        yield chunk
+                    return
+
+                dc_id = file_id.dc_id
+                try:
+                    pool = await self_cli._ensure_media_pool(dc_id, target_size=6)
+                except Exception:
+                    pool = []
+
+                if not pool:
+                    async for chunk in super().get_file(
+                        file_id, file_size=file_size, limit=limit, offset=offset, progress=progress, progress_args=progress_args
+                    ):
+                        yield chunk
+                    return
+
+                if FileType is not None and file_type == FileType.PHOTO:
+                    location = raw.types.InputPhotoFileLocation(
+                        id=file_id.media_id,
+                        access_hash=file_id.access_hash,
+                        file_reference=file_id.file_reference,
+                        thumb_size=file_id.thumbnail_size,
+                    )
+                else:
+                    location = raw.types.InputDocumentFileLocation(
+                        id=file_id.media_id,
+                        access_hash=file_id.access_hash,
+                        file_reference=file_id.file_reference,
+                        thumb_size=file_id.thumbnail_size,
+                    )
+
+                chunk_size = 1024 * 1024
+                async with self_cli.get_file_semaphore:
+                    r0 = await pool[0].invoke(
+                        raw.functions.upload.GetFile(location=location, offset=0, limit=chunk_size),
+                        sleep_threshold=60,
+                    )
+                    if not isinstance(r0, raw.types.upload.File):
+                        # Release semaphore and fall back cleanly for CDN redirects
                         pass
-                self_cli._media_pool.clear()
+                    else:
+                        chunk0 = r0.bytes
+                        yield chunk0
+                        done_bytes = len(chunk0)
+                        if progress:
+                            res = progress(min(done_bytes, file_size), file_size, *progress_args)
+                            if inspect.isawaitable(res):
+                                await res
+                        if len(chunk0) < chunk_size or done_bytes >= file_size:
+                            return
+
+                        total_chunks = int(math.ceil(file_size / chunk_size))
+                        workers_count = min(12, total_chunks - 1)
+                        max_ahead = 16
+                        next_req = 1
+                        next_yield = 1
+                        eof_idx = None
+                        results: dict[int, bytes] = {}
+                        failures: list[Exception] = []
+                        data_event = asyncio.Event()
+                        space_event = asyncio.Event()
+
+                        async def _dl_worker(w_idx: int):
+                            nonlocal next_req, eof_idx
+                            sess = pool[w_idx % len(pool)]
+                            while True:
+                                if failures or cancelled:
+                                    data_event.set()
+                                    return
+                                if eof_idx is not None and next_req >= eof_idx:
+                                    return
+                                if next_req >= total_chunks:
+                                    return
+                                if next_req - next_yield >= max_ahead:
+                                    space_event.clear()
+                                    if next_req - next_yield >= max_ahead and not (failures or cancelled):
+                                        await space_event.wait()
+                                        continue
+                                idx = next_req
+                                next_req += 1
+                                if idx >= total_chunks or (eof_idx is not None and idx >= eof_idx):
+                                    return
+                                try:
+                                    resp = await sess.invoke(
+                                        raw.functions.upload.GetFile(
+                                            location=location,
+                                            offset=idx * chunk_size,
+                                            limit=chunk_size,
+                                        ),
+                                        sleep_threshold=60,
+                                    )
+                                    if not isinstance(resp, raw.types.upload.File):
+                                        raise RuntimeError("Unexpected non-file response during GetFile")
+                                    b = resp.bytes
+                                    results[idx] = b
+                                    if len(b) < chunk_size and (eof_idx is None or idx + 1 < eof_idx):
+                                        eof_idx = idx + 1
+                                    data_event.set()
+                                except Exception as exc:
+                                    failures.append(exc)
+                                    data_event.set()
+                                    return
+
+                        worker_tasks = [asyncio.create_task(_dl_worker(i)) for i in range(workers_count)]
+                        try:
+                            while next_yield < total_chunks:
+                                if eof_idx is not None and next_yield >= eof_idx:
+                                    break
+                                if cancelled:
+                                    raise pyrogram.StopTransmission()
+                                if failures:
+                                    raise failures[0]
+                                if next_yield not in results:
+                                    data_event.clear()
+                                    if next_yield not in results and not failures and not cancelled:
+                                        if eof_idx is not None and next_yield >= eof_idx:
+                                            break
+                                        await data_event.wait()
+                                    continue
+
+                                chunk = results.pop(next_yield)
+                                next_yield += 1
+                                space_event.set()
+                                if not chunk:
+                                    break
+                                yield chunk
+                                done_bytes += len(chunk)
+                                if progress:
+                                    res = progress(min(done_bytes, file_size), file_size, *progress_args)
+                                    if inspect.isawaitable(res):
+                                        await res
+                        finally:
+                            space_event.set()
+                            for t in worker_tasks:
+                                if not t.done():
+                                    t.cancel()
+                            await asyncio.gather(*worker_tasks, return_exceptions=True)
+                        return
+
+                async for chunk in super().get_file(
+                    file_id, file_size=file_size, limit=limit, offset=offset, progress=progress, progress_args=progress_args
+                ):
+                    yield chunk
 
             async def save_file(self_cli, path, file_id=None, file_part=0, progress=None, progress_args=()):
                 if path is None:
@@ -3693,20 +3895,20 @@ class Mirror:
                 await app.close_media_pool()
         return sent_items
 
-    def split_for_telegram(self, fpath: Path) -> list:
+    def _split_7z_volumes(self, fpath: Path, max_bytes: int, vol_bytes: int, limit_desc: str) -> list:
         sz = fpath.stat().st_size
-        if sz < TG_BOT_MAX_BYTES:
+        if sz < max_bytes:
             return [fpath]
         du_free = shutil.disk_usage("/").free
         if du_free < sz * 1.05:
             raise RuntimeError(
-                f"File '{fpath.name}' ({fmt_bytes(sz)}) exceeds 2 GB Telegram limit and remaining disk ({fmt_bytes(du_free)}) is too small to split it."
+                f"File '{fpath.name}' ({fmt_bytes(sz)}) exceeds {limit_desc} limit and remaining disk ({fmt_bytes(du_free)}) is too small to split it."
             )
         OUT_DIR.mkdir(parents=True, exist_ok=True)
         split_dir = OUT_DIR / f"split_{uuid.uuid4().hex[:8]}"
         split_dir.mkdir(parents=True, exist_ok=True)
         base_archive = split_dir / f"{fpath.name}.7z"
-        vol_mb = TG_SPLIT_BYTES // (1024 * 1024)
+        vol_mb = vol_bytes // (1024 * 1024)
         cmd = ["7z", "a", "-t7z", "-mx=0", f"-v{vol_mb}m", "-bsp1", "-bb0"]
         if self.password:
             cmd += [f"-p{self.password}", "-mhe=on"]
@@ -3715,9 +3917,238 @@ class Mirror:
         parts = sorted(p for p in split_dir.iterdir() if p.is_file() and p.stat().st_size > 0)
         if rc not in (0, 1) or not parts:
             shutil.rmtree(split_dir, ignore_errors=True)
-            raise RuntimeError(f"Failed to split '{fpath.name}' into < 2 GB Telegram volumes.")
+            raise RuntimeError(f"Failed to split '{fpath.name}' into < {limit_desc} volumes.")
         fpath.unlink(missing_ok=True)
         return parts
+
+    def split_for_telegram(self, fpath: Path) -> list:
+        return self._split_7z_volumes(fpath, TG_BOT_MAX_BYTES, TG_SPLIT_BYTES, "2 GB Telegram")
+
+    def _run_gh_cli(self, args: list, env: dict, tick_ctx: dict = None) -> tuple:
+        global cancelled
+        proc = subprocess.Popen(
+            ["gh", *args],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        buf = []
+
+        def _drain():
+            try:
+                for line in proc.stdout:
+                    buf.append(line)
+            except Exception:
+                pass
+
+        reader = threading.Thread(target=_drain, daemon=True)
+        reader.start()
+
+        step_start = time.time()
+        while True:
+            rc = proc.poll()
+            if cancelled:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                reader.join(timeout=2)
+                raise InterruptedError("Cancelled by user")
+            if tick_ctx:
+                now = time.time()
+                done_prev = tick_ctx["done_prev"]
+                total_all = max(1, tick_ctx["total_all"])
+                cur_sz = tick_ctx["cur_sz"]
+                # Estimate gradual progress during single asset upload so status card stays responsive
+                elapsed_s = max(0.0, now - step_start)
+                est_rate = tick_ctx.get("avg_bps") or (8 * 1024 * 1024)
+                est_cur = min(int(cur_sz * 0.95), int(elapsed_s * est_rate))
+                agg_done = min(total_all, done_prev + est_cur)
+                pct = (100.0 * agg_done / total_all) if total_all > 0 else 0.0
+                spd = est_cur / elapsed_s if elapsed_s > 1.0 and est_cur > 0 else tick_ctx.get("avg_bps", 0)
+                eta = ((total_all - agg_done) / spd) if spd > 0 and total_all > agg_done else None
+                self.tick(
+                    tick_ctx["fname"],
+                    tick_ctx["label"],
+                    pct,
+                    agg_done,
+                    total_all,
+                    spd,
+                    eta,
+                    "GitHub CLI (gh)",
+                )
+            if rc is not None:
+                break
+            time.sleep(0.5)
+
+        reader.join(timeout=5)
+        out = "".join(buf)
+        if self.gh_pat:
+            out = out.replace(self.gh_pat, "***")
+        return rc, out.strip()
+
+    def upload_github_release(self, target: Path) -> list:
+        if not self.gh_pat or not self.gh_repo:
+            raise RuntimeError("GitHub Release requires a connected GitHub PAT (/ghlogin) and target repository.")
+        if not shutil.which("gh"):
+            raise RuntimeError("GitHub CLI (gh) is not installed on the runner.")
+
+        if target.is_file():
+            raw_files = [target]
+            base_root = target.parent
+        elif target.is_dir():
+            raw_files = sorted(
+                p for p in target.rglob("*")
+                if p.is_file() and not p.name.endswith((".aria2", ".ytdl", ".part")) and p.stat().st_size > 0
+            )
+            base_root = target
+        else:
+            raise RuntimeError("No downloaded file found to publish to GitHub Release.")
+        if not raw_files:
+            raise RuntimeError("Downloaded folder contains no files to publish to GitHub Release.")
+
+        upload_queue = []
+        split_dirs = set()
+        stage_dir = None
+        seen_names = set()
+        try:
+            for f in raw_files:
+                if f.stat().st_size >= GH_ASSET_MAX_BYTES:
+                    parts = self._split_7z_volumes(f, GH_ASSET_MAX_BYTES, GH_SPLIT_BYTES, "2 GiB GitHub Release")
+                    for part in parts:
+                        split_dirs.add(part.parent)
+                        upload_queue.append(part)
+                else:
+                    if f.name in seen_names:
+                        if stage_dir is None:
+                            OUT_DIR.mkdir(parents=True, exist_ok=True)
+                            stage_dir = OUT_DIR / f"ghstage_{uuid.uuid4().hex[:8]}"
+                            stage_dir.mkdir(parents=True, exist_ok=True)
+                        try:
+                            rel_safe = str(f.relative_to(base_root)).replace("/", "__")
+                        except Exception:
+                            rel_safe = f"{uuid.uuid4().hex[:4]}_{f.name}"
+                        staged = stage_dir / rel_safe
+                        os.link(f, staged) if not staged.exists() else None
+                        upload_queue.append(staged)
+                    else:
+                        seen_names.add(f.name)
+                        upload_queue.append(f)
+
+            gh_env = {**os.environ, "GH_TOKEN": self.gh_pat, "GH_PAGER": "cat", "NO_COLOR": "1"}
+            tag = self.gh_tag or datetime.now(timezone.utc).strftime("v%Y%m%d-%H%M%S")
+            title = self.gh_title or (target.name if not self.batch else f"Release {tag}")
+
+            self.tick(upload_queue[0].name, "Preparing GH Release..", 0.0, 0, sum(p.stat().st_size for p in upload_queue), 0, None, "GitHub CLI (gh)", force=True)
+
+            rc_view, out_view = self._run_gh_cli(
+                ["release", "view", tag, "--repo", self.gh_repo, "--json", "url,isDraft"],
+                gh_env,
+            )
+            rel_existed = (rc_view == 0)
+            created_draft_tag = None
+
+            if not rel_existed:
+                create_cmd = [
+                    "release", "create", tag,
+                    "--repo", self.gh_repo,
+                    "--title", title,
+                    "--draft",
+                ]
+                if self.gh_generate_notes:
+                    create_cmd.append("--generate-notes")
+                else:
+                    create_cmd.extend(["--notes", self.gh_notes or ""])
+                if self.gh_prerelease:
+                    create_cmd.append("--prerelease")
+
+                rc_cr, out_cr = self._run_gh_cli(create_cmd, gh_env)
+                if rc_cr != 0:
+                    raise RuntimeError(f"gh release create failed: {truncate(out_cr, 300)}")
+                created_draft_tag = tag
+
+            total_all = sum(p.stat().st_size for p in upload_queue)
+            done_bytes = 0
+            up_start = time.time()
+            n_assets = len(upload_queue)
+
+            try:
+                for idx, fpath in enumerate(upload_queue, 1):
+                    sz = fpath.stat().st_size
+                    label = f"GH Asset {idx}/{n_assets}.." if n_assets > 1 else "Uploading GH Asset.."
+                    avg_bps = (done_bytes / max(0.5, time.time() - up_start)) if done_bytes > 0 else 0
+                    self.tick(fpath.name, label, (100.0 * done_bytes / total_all) if total_all else 0.0, done_bytes, total_all, avg_bps, None, "GitHub CLI (gh)", force=True)
+
+                    rc_up, out_up = self._run_gh_cli(
+                        ["release", "upload", tag, str(fpath), "--repo", self.gh_repo, "--clobber"],
+                        gh_env,
+                        tick_ctx={
+                            "fname": fpath.name,
+                            "label": label,
+                            "done_prev": done_bytes,
+                            "total_all": total_all,
+                            "cur_sz": sz,
+                            "avg_bps": avg_bps,
+                        },
+                    )
+                    if rc_up != 0:
+                        raise RuntimeError(f"gh release upload failed for {fpath.name}: {truncate(out_up, 280)}")
+                    done_bytes += sz
+            except InterruptedError:
+                if created_draft_tag:
+                    subprocess.run(
+                        ["gh", "release", "delete", created_draft_tag, "--repo", self.gh_repo, "--yes"],
+                        env=gh_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                raise
+
+            if not self.gh_draft and (created_draft_tag or (rel_existed and '"isDraft":true' in out_view.replace(" ", ""))):
+                edit_cmd = ["release", "edit", tag, "--repo", self.gh_repo, "--draft=false"]
+                if self.gh_prerelease:
+                    edit_cmd.append("--prerelease=true")
+                rc_ed, out_ed = self._run_gh_cli(edit_cmd, gh_env)
+                if rc_ed != 0:
+                    raise RuntimeError(f"Failed to publish GitHub Release: {truncate(out_ed, 280)}")
+
+            rc_fin, out_fin = self._run_gh_cli(
+                ["release", "view", tag, "--repo", self.gh_repo, "--json", "url,tagName,name,isDraft,isPrerelease,assets"],
+                gh_env,
+            )
+            rel_url = f"https://github.com/{self.gh_repo}/releases/tag/{urllib.parse.quote(tag)}"
+            assets_by_name = {}
+            if rc_fin == 0 and out_fin:
+                try:
+                    rel_info = json.loads(out_fin)
+                    rel_url = rel_info.get("url") or rel_url
+                    for a in rel_info.get("assets") or []:
+                        if a.get("name"):
+                            assets_by_name[a["name"]] = a.get("url") or ""
+                except Exception:
+                    pass
+            self.gh_release_url = rel_url
+            self.gh_tag = tag
+            self.gh_title = title
+
+            items_out = []
+            for fpath in upload_queue:
+                sz = fpath.stat().st_size
+                dl_url = assets_by_name.get(fpath.name) or f"https://github.com/{self.gh_repo}/releases/download/{urllib.parse.quote(tag)}/{urllib.parse.quote(fpath.name)}"
+                items_out.append({
+                    "name": fpath.name,
+                    "size": sz,
+                    "status": "completed",
+                    "link": dl_url if not self.gh_draft else rel_url,
+                    "direct": dl_url if not self.gh_draft else "",
+                    "releaseUrl": rel_url,
+                    "shared": not self.gh_draft,
+                })
+            return items_out
+        finally:
+            for sd in split_dirs:
+                shutil.rmtree(sd, ignore_errors=True)
+            if stage_dir:
+                shutil.rmtree(stage_dir, ignore_errors=True)
 
     def upload_telegram(self, target: Path) -> list:
         if not BOT_TOKEN or not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
@@ -3920,7 +4351,7 @@ class Mirror:
             meta = self.gdrive_meta(item)
             name = self.single_name() or meta["name"]
             mime = meta.get("mimeType", "")
-            if self.dest not in ("gofile", "telegram"):
+            if self.dest not in ("gofile", "telegram", "ghrelease"):
                 if mime == FOLDER_MIME and self.mode != "zip":
                     return self.gdrive_clone_folder(meta, name)
                 if mime != FOLDER_MIME and (self.mode == "normal" or mime.startswith("application/vnd.google-apps.")):
@@ -3971,7 +4402,7 @@ class Mirror:
         all_light_disk = all(it.get("type") in ("ytdl", "tg_media") for it in self.items)
         if not all_light_disk:
             est = int(self.job.get("fileSize") or 0)
-            needs_split = (self.dest == "telegram") and est >= TG_BOT_MAX_BYTES
+            needs_split = (self.dest in ("telegram", "ghrelease")) and est >= TG_BOT_MAX_BYTES
             mult = 2.2 if (self.mode in ("extract", "zip") or needs_split) else 1.15
             needed = (int(est * mult) + 4 * 1024**3) if est > 0 else (35 * 1024**3 if self.batch else 0)
             if needed > 0:
@@ -4033,12 +4464,72 @@ class Mirror:
         overall = "completed" if ok else "failed"
         is_leech = self.dest == "telegram"
         is_gofile = self.dest == "gofile"
-        is_gc_temp = bool(self.is_shared_gc_temp and not is_gofile and not is_leech)
+        is_gh_release = self.dest == "ghrelease"
+        is_gc_temp = bool(self.is_shared_gc_temp and not is_gofile and not is_leech and not is_gh_release)
         completed_with_id = [r for r in ok if r.get("status") == "completed" and r.get("id")]
         total_gc_size = sum(int(r.get("size") or 0) for r in completed_with_id)
         can_req_perm = bool(is_gc_temp and completed_with_id and total_gc_size <= PERM_REQ_MAX_BYTES)
 
-        if is_leech:
+        if is_gh_release:
+            if not ok and len(results) == 1 and results[0].get("status") == "failed":
+                raise RuntimeError(results[0].get("error") or "GitHub Release failed")
+            rel_url = self.gh_release_url or next((r.get("releaseUrl") for r in ok if r.get("releaseUrl")), "") or f"https://github.com/{self.gh_repo}/releases"
+            total_sz = sum(int(r.get("size") or 0) for r in ok)
+            flags = []
+            if self.gh_draft:
+                flags.append("Draft")
+            if self.gh_prerelease:
+                flags.append("Pre-release")
+            flag_line = f"Type  ·  <code>{', '.join(flags)}</code>\n\n" if flags else ""
+
+            if len(results) == 1 and ok:
+                r = ok[0]
+                text = (
+                    f"<blockquote><b>GitHub Release Published</b>\n\n"
+                    f"<code>{html.escape(r['name'])}</code></blockquote>\n\n"
+                    f"Size  ·  <code>{fmt_bytes(r.get('size', 0))}</code>\n\n"
+                    f"Repo  ·  <code>{html.escape(self.gh_repo)}</code>\n\n"
+                    f"Tag  ·  <code>{html.escape(self.gh_tag)}</code>\n\n"
+                    f"{flag_line}"
+                    f"Elapsed  ·  <code>{elapsed}</code>\n\nUser  ·  {html.escape(self.uname())}"
+                )
+                btns = [{"text": "▸  Open Release", "url": rel_url, "style": "success"}]
+                if r.get("direct"):
+                    btns.append({"text": "⬇ Download Asset", "url": r["direct"], "style": "primary"})
+                kb = {"inline_keyboard": [btns]}
+            else:
+                header = (
+                    f"<blockquote><b>{'GitHub Release Published' if ok else 'GitHub Release Failed'}</b>\n\n"
+                    f"<code>{len(ok)} / {len(results)} asset(s)</code>"
+                    f"{f' · {fmt_bytes(total_sz)}' if total_sz > 0 else ''}</blockquote>\n\n"
+                )
+                footer = (
+                    f"\nRepo  ·  <code>{html.escape(self.gh_repo)}</code>\n\n"
+                    f"Tag  ·  <code>{html.escape(self.gh_tag)}</code>\n\n"
+                    f"{flag_line}"
+                    f"Elapsed  ·  <code>{elapsed}</code>\n\nUser  ·  {html.escape(self.uname())}"
+                )
+                body = ""
+                for n, r in enumerate(results, 1):
+                    name = html.escape(truncate(r.get("name", "asset"), 48))
+                    if r.get("status") == "completed":
+                        if r.get("direct"):
+                            line = f"{n}. ✓ <a href=\"{html.escape(r['direct'], quote=True)}\">{name}</a>  <code>{fmt_bytes(r.get('size', 0))}</code>\n"
+                        else:
+                            line = f"{n}. ✓ <code>{name}</code>  <code>{fmt_bytes(r.get('size', 0))}</code>\n"
+                    else:
+                        line = f"{n}. ✗ <code>{name}</code>\n    <i>{html.escape(truncate(r.get('error', 'failed'), 120))}</i>\n"
+                    if len(header) + len(body) + len(line) + len(footer) > 3900:
+                        body += f"\n<i>…and {len(results) - n + 1} more asset(s).</i>\n"
+                        break
+                    body += line
+                text = header + body + footer
+                btns = [{"text": "▸  Open Release", "url": rel_url, "style": "success"}]
+                first_dl = next((r.get("direct") for r in ok if r.get("direct")), "")
+                if first_dl:
+                    btns.append({"text": "⬇ Download First Asset", "url": first_dl, "style": "primary"})
+                kb = {"inline_keyboard": [btns]}
+        elif is_leech:
             if not ok and len(results) == 1 and results[0].get("status") == "failed":
                 raise RuntimeError(results[0].get("error") or "Leech failed")
             total_sz = sum(int(r.get("size") or 0) for r in ok)
