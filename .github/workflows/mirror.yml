@@ -23,7 +23,7 @@ jobs:
       - name: Execute Mirror Job
         env:
           JOB_ID: ${{ github.event.inputs.job_id }}
-          WORKER_URL: https://telegram-gdrive-bot.yashdaive.workers.dev
+          WORKER_URL: https://telegram-gdrive-bot.davexh.workers.dev
           JOB_SECRET: ${{ secrets.JOB_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}

@@ -1,19 +1,21 @@
 name = "telegram-gdrive-bot"
 main = "index.js"
 compatibility_date = "2024-11-01"
+keep_vars = true
 
 [triggers]
 crons = ["0 */6 * * *"]
 
 [vars]
-GITHUB_OWNER = "Another-yashu-2"
+GITHUB_OWNER = "Annhonii"
 GITHUB_REPO = "waguri-paglu-mirror-bot"
 GITHUB_WORKFLOW = "mirror.yml"
-WORKER_URL = "https://telegram-gdrive-bot.yashdaive.workers.dev"
+WORKER_URL = "https://telegram-gdrive-bot.davexh.workers.dev"
+OWNER_ID = "8699286601"
 
 [[kv_namespaces]]
 binding = "SETTINGS_KV"
-id = "986025f566ad4cd996134e705723ff77"
+id = "4c0b70d5a95546148d8578b1d71273af"
 
 [[durable_objects.bindings]]
 name = "STATE_DO"

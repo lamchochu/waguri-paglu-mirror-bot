@@ -182,7 +182,7 @@ const FOLDER_MIME = 'application/vnd.google-apps.folder';
 const RUNNER_LIMIT_BYTES = 112 * 1024 * 1024 * 1024;
 const MAX_BATCH_URLS = 50;
 const MAX_HISTORY_ITEMS = 15;
-const OWNER_ID = '8138661911';
+const OWNER_ID = '8699286601';
 const TG_BOT_MAX_BYTES = 2000 * 1024 * 1024;
 const GC_TEMP_FOLDER_NAME = 'GC_Temp_5Days';
 const GC_PERM_FOLDER_NAME = 'gcusrfiles';
@@ -310,7 +310,7 @@ export default {
 // ============================================================================
 
 function getWorkerBaseUrl(env) {
-  return (env.WORKER_URL || 'https://telegram-gdrive-bot.yashdaive.workers.dev').replace(/\/$/, '');
+  return (env.WORKER_URL || 'https://telegram-gdrive-bot.davexh.workers.dev').replace(/\/$/, '');
 }
 
 async function createOAuthUrl(chatId, userId, username, env) {
